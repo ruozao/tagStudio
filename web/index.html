@@ -31,6 +31,7 @@
   </div>
   <div class="search-wrap">
     <input id="search" type="search" placeholder="搜索文件名 / 标签…（回车立即筛选）" spellcheck="false" />
+    <button id="suggestChip" class="chip suggest-chip" type="button" hidden></button>
   </div>
   <div class="topbar-actions">
     <select id="kindFilter" title="按类型筛选">
@@ -209,6 +210,24 @@
     <div class="dialog-actions">
       <button id="brCancel" class="btn ghost" type="button">取消</button>
       <button id="brPick" class="btn primary" type="button">选这个文件夹</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- 从文件名里认出旧标签时的确认弹窗 -->
+<dialog id="suggestDlg" class="dialog">
+  <div class="dialog-body">
+    <h3>这些文件名里好像带着标签</h3>
+    <p class="hint">
+      打开这个文件夹时发现有一些素材的文件名长得像「标签1-标签2.扩展名」——可能是以前用本工具打过标签、
+      或者从别的设备按这个规则改过名。要不要把它们认成标签？
+      <b>点「采纳」会把文件重命名成规范的「标签-uuid.扩展名」，原文件不会被删除。</b>
+    </p>
+    <div id="sugList" class="suglist"></div>
+    <div class="dialog-actions">
+      <button id="sugIgnore" class="btn ghost" type="button">都先不用</button>
+      <button id="sugClose" class="btn ghost" type="button">关闭</button>
+      <button id="sugAccept" class="btn primary" type="button">全部采纳</button>
     </div>
   </div>
 </dialog>

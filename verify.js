@@ -847,6 +847,110 @@ async function testRealVideos() {
   note(`复制 ${util.humanBytes(totalSrc)} 耗时 ${Math.round((Date.now() - t1) / 1000)} 秒`);
 }
 
+// ------------------------------------------------------------------ 8. 从文件名认出旧标签
+
+/**
+ * 场景：把以前用本工具打过标签的素材（文件名是「标签1-标签2.扩展名」，没有 uuid）
+ * 再导进一个新库。程序应该认出这些标签，并且在**用户确认后**才改名。
+ * 之所以必须确认而不能自动改：`2024-08-23 直播录屏.mp4` 这种名字长得一模一样，
+ * 程序没法区分 `2024` 是标签还是日期的一部分。
+ */
+async function testSuggestions() {
+  group('8. 从文件名里认出旧标签（tag1-tag2.mp4）');
+
+  const lib = path.join(VDIR, 'sug');
+  await freshDir(lib);
+  const uuid = util.hex32();
+  await writeFile(path.join(lib, '旅行-风景.mp4'), 'v1');
+  await writeFile(path.join(lib, '助眠-直播录屏-轻语.mp3'), 'a1');
+  await writeFile(path.join(lib, '2024-08-23 直播录屏.mp4'), 'v2');
+  await writeFile(path.join(lib, `旅行-风景-${uuid}.jpg`), 'i1'); // 已经是规范名
+  await writeFile(path.join(lib, '单段.mp4'), 'v3');             // 没有连字符，看不出标签
+  await writeFile(path.join(lib, '带.点-标签.mp4'), 'v4');        // 点号是非法字符，不该当标签
+
+  const { db, library } = await makeLibrary(lib);
+  const scan = await library.scan({ rename: true, prune: true });
+  eq('扫描到 6 个素材', scan.added, 6);
+  eq('扫描时没有自动改名（不该动的就不动）', scan.renamed, 0);
+  check('6 个文件都还在磁盘上', listDisk(lib).length === 6, listDisk(lib).join(' | '));
+
+  const sug = library.suggestions();
+  const keys = sug.groups.map((g) => g.tags.join('-'));
+  eq('认出 3 组建议（前两组是干净的标签名，第三组是日期型名字）', sug.count, 3);
+  note(`认出来的标签组：${keys.join(' / ')}`);
+  check('「旅行-风景.mp4」给出标签建议', keys.includes('旅行-风景'), keys.join(' | '));
+  check('「助眠-直播录屏-轻语.mp3」给出三个标签的建议', keys.includes('助眠-直播录屏-轻语'), keys.join(' | '));
+  check('「2024-08-23 直播录屏.mp4」被当成候选（程序分不清，交给用户判断）',
+    keys.some((k) => k.includes('2024')), keys.join(' | '));
+  check('「单段.mp4」不给建议（没有连字符）', !sug.groups.some((g) => g.ids.includes(db.items().find((i) => i.name === '单段.mp4').id)));
+  check('「带.点-标签.mp4」不给建议（点号不合法）', !sug.groups.some((g) => g.ids.includes(db.items().find((i) => i.name === '带.点-标签.mp4').id)));
+  check('已经规范命名的素材不重复建议', !sug.groups.some((g) => g.ids.includes(uuid)));
+  eq('已经有标签的素材不再当候选', db.items().filter((i) => i.tagSuggest && i.tags.length).length, 0);
+
+  const preview = sug.groups.find((g) => g.tags.join('-') === '旅行-风景');
+  eq('建议里带一条预览样例', preview.items.length, 1);
+  eq('预览里显示原名', preview.items[0].origName, '旅行-风景.mp4');
+  check('预览里显示改名后会是什么样', /^旅行-风景-[0-9a-f]{32}\.mp4$/.test(preview.items[0].target), preview.items[0].target);
+
+  // ---- 采纳
+  const acc = await library.acceptSuggestions(preview.ids, { tags: preview.tags });
+  eq('采纳成功', acc.accepted, 1);
+  eq('采纳后没有失败', acc.failures.length, 0);
+  const accItem = db.get(preview.ids[0]);
+  eq('标签写进了库', JSON.stringify(accItem.tags), JSON.stringify(['旅行', '风景']));
+  check('磁盘文件名变成了规范名', fs.existsSync(path.join(lib, accItem.name)), listDisk(lib).join(' | '));
+  check('采纳后这条不再出现在建议里', !library.suggestions().groups.some((g) => g.ids.includes(accItem.id)));
+  check('采纳后文件名里带该素材的 uuid', accItem.name.includes(accItem.id), accItem.name);
+
+  // ---- 「不用」
+  const dateGroup = library.suggestions().groups.find((g) => g.tags.includes('2024'));
+  const ign = await library.ignoreSuggestions(dateGroup.ids);
+  eq('点「不用」记下了 1 条', ign.ignored, 1);
+  check('「不用」之后不再给这组建议', !library.suggestions().groups.some((g) => g.ids.includes(dateGroup.ids[0])));
+  check('「不用」不碰磁盘文件', listDisk(lib).some((n) => n === '2024-08-23 直播录屏.mp4'), listDisk(lib).join(' | '));
+  const afterScan = await library.scan({ rename: true, prune: true });
+  check('再扫一遍也不会把「不用」过的名字纠正成未分类名', listDisk(lib).some((n) => n === '2024-08-23 直播录屏.mp4'),
+    listDisk(lib).join(' | '));
+  eq('再扫没有意外改名', afterScan.renamed, 0);
+
+  // 用户自己改名 → 旧决定失效，应该重新给建议
+  const dateItem = db.get(dateGroup.ids[0]);
+  await fsp.rename(path.join(lib, dateItem.name), path.join(lib, '旅行-风景-新名字.mp4'));
+  await library.scan({ rename: true, prune: true });
+  check('用户自己改名后，旧决定失效、重新给建议',
+    library.suggestions().groups.some((g) => g.tags.includes('旅行')), JSON.stringify(library.suggestions().groups.map((g) => g.tags)));
+
+  // 全部采纳（就是弹窗上的「全部采纳」按钮走的那条路）
+  const accAll = await library.acceptSuggestions(library.suggestions().groups.flatMap((g) => g.ids));
+  check('全部采纳成功', accAll.accepted >= 1, JSON.stringify(accAll));
+  eq('全部采纳之后建议清零', library.suggestions().itemCount, 0);
+  eq('全部采纳后没有失败', accAll.failures.length, 0);
+  check('所有认出来的素材都改成了规范名',
+    listDisk(lib).filter((n) => !/[0-9a-f]{32}\./.test(n)).every((n) => n === '单段.mp4' || n === '带.点-标签.mp4'),
+    listDisk(lib).join(' | '));
+  check('全程没有丢掉任何文件的记录',
+    db.items().length === listDisk(lib).length, `库 ${db.items().length} / 磁盘 ${listDisk(lib).length}`);
+
+  // 已经打过标签的素材：清空标签后规则是「回到原始文件名」。这里原始名正是
+  // `旅行-风景.mp4`，所以会退回它（用户清空标签 = 回到没分类，文件名也从头来）。
+  const cleared = db.get(accItem.id);
+  await library.applyTags(cleared.id, { mode: 'set', tags: [] });
+  eq('清空标签后文件名回到原始文件名（本工具的素材）', db.get(accItem.id).name, '旅行-风景.mp4');
+  // 而**外部**拷进来的「标签-uuid.扩展名」：标签是按文件名认下的（inferred），
+  // 清空标签时不该退回那个还带着旧标签的原始名，否则下次扫描又把它当候选，来回折腾。
+  const orphanId = util.hex32();
+  await writeFile(path.join(lib, `旅行-风景-${orphanId}.jpg`), 'i2');
+  await library.scan({ rename: true, prune: true });
+  const orphan = db.get(orphanId);
+  eq('外部导入的规范名文件，标签直接按文件名认下', JSON.stringify(orphan.tags), JSON.stringify(['旅行', '风景']));
+  eq('并且不把它列为待确认的建议', orphan.tagSuggest, null);
+  await library.applyTags(orphanId, { mode: 'set', tags: [] });
+  await library.scan({ rename: true, prune: true });
+  eq('清空标签后名字里保留 uuid（不退回带旧标签的原名）', db.get(orphanId).name, `${orphanId}.jpg`);
+  check('并且不会被当成待确认的建议',
+    db.get(orphanId).tagSuggest === null, JSON.stringify(db.get(orphanId).tagSuggest));
+}
+
 // ------------------------------------------------------------------ 主流程
 
 async function main() {
@@ -861,6 +965,7 @@ async function main() {
   await testLibraryScanAndRename();
   await testJournalRecovery();
   await testExport();
+  await testSuggestions();
   if (!QUICK) await testServer();
   else note('--quick：跳过 HTTP 服务验证');
   if (!QUICK) await testRealVideos();

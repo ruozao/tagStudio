@@ -12,7 +12,7 @@
     "start": "node server.js",
     "verify": "node verify.js",
     "verify:quick": "node verify.js --quick",
-    "verify:all": "node verify.js && node probe_external.js && node browser_test.js && node e2e_real.js"
+    "verify:all": "node verify.js && node probe_external.js && node browser_test.js && node suggest_test.js && node e2e_real.js"
   },
   "dependencies": {},
   "keywords": [

@@ -16,6 +16,10 @@
 /.browser/
 /.capture/
 /.finalcheck/
+/.suggest/
+# 调试时随手写的一次性脚本与临时库（.dbg*.js / .dbg*/ 这种）
+/.dbg*
+/.re.js
 # e2e_real.js 用来记住素材原始名字的基准（每台机器自己生成，不该进版本库）
 /.e2e-fixture-baseline.json
 

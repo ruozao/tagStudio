@@ -240,6 +240,36 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .tagmini.none { color: var(--warn); border-color: #4a3a1c; background: #241c0d; }
 .card .warn { font-size: 11px; color: var(--warn); }
 
+/* 「文件名里像是标签」的提示：卡片上直接给一条，点了就打开确认弹窗 */
+.sugchip {
+  font-size: 11px; border-radius: 6px; padding: 1px 6px; cursor: pointer;
+  color: var(--warn); border: 1px dashed #4a3a1c; background: #241c0d;
+  width: fit-content; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sugchip:hover { background: #2f2410; }
+
+.suggest-chip {
+  border: 1px solid #4a3a1c; background: #241c0d; color: var(--warn);
+  border-radius: 999px; padding: 3px 10px; font-size: 12px; cursor: pointer; white-space: nowrap;
+}
+.suggest-chip:hover { background: #2f2410; }
+.suggest-chip[hidden] { display: none !important; }
+
+/* 确认弹窗里的一组建议 */
+.suglist { display: flex; flex-direction: column; gap: 12px; }
+.suggroup { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: #0e1116; }
+.sughead { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.sugtags { display: flex; gap: 6px; flex-wrap: wrap; }
+.sugitems { display: flex; flex-direction: column; gap: 6px; max-height: 190px; overflow: auto; }
+.sugitem { display: grid; grid-template-columns: 44px 1fr; gap: 8px; align-items: start; font-size: 12px; }
+.sugkind { color: var(--fg3); font-size: 11px; padding-top: 2px; }
+.sugnames { min-width: 0; }
+.sugold { color: var(--fg2); word-break: break-all; }
+.sugnewline { display: flex; gap: 6px; align-items: baseline; }
+.sugarrow { color: var(--fg3); }
+.sugnew { color: #9fe0a8; word-break: break-all; }
+.sugacts { display: flex; gap: 8px; margin-top: 10px; }
+
 .empty { text-align: center; color: var(--fg3); padding: 60px 20px; }
 .empty h3 { color: var(--fg2); margin: 0 0 8px; }
 

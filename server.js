@@ -489,6 +489,37 @@ route('POST', /^\/api\/items\/bulk$/, async (req) => {
   return { ...res, stats: state.db.stats(), tags: state.db.tagList() };
 });
 
+// --- 从文件名认出旧标签（「tag1-tag2.mp4」这种没有 uuid 的）--------------------
+//
+// 把以前用本工具打过标签、或从别的设备按同样规则命名过的素材再导进来时，
+// 文件名本身就把标签带着。但「2024-08-23 直播录屏.mp4」这种名字长得一模一样，
+// 程序分不清是标签还是文件名的一部分，所以只给建议，**由用户在弹窗里决定**。
+
+route('GET', /^\/api\/suggestions$/, async () => {
+  requireLibrary();
+  return state.library.suggestions();
+});
+
+route('POST', /^\/api\/suggestions\/accept$/, async (req) => {
+  requireLibrary();
+  const body = await readBody(req);
+  let ids = Array.isArray(body.ids) ? body.ids.map(String) : [];
+  if (!ids.length) ids = state.library.suggestions().groups.flatMap((g) => g.ids);
+  if (!ids.length) return { ok: true, accepted: 0, skipped: 0, failures: [], remaining: 0, stats: state.db.stats(), tags: state.db.tagList() };
+  const tags = Array.isArray(body.tags) ? body.tags : (body.tags ? tagsMod.splitTagInput(body.tags) : null);
+  const res = await state.library.acceptSuggestions(ids, { tags });
+  return { ...res, stats: state.db.stats(), tags: state.db.tagList() };
+});
+
+route('POST', /^\/api\/suggestions\/ignore$/, async (req) => {
+  requireLibrary();
+  const body = await readBody(req);
+  let ids = Array.isArray(body.ids) ? body.ids.map(String) : [];
+  if (!ids.length) ids = state.library.suggestions().groups.flatMap((g) => g.ids);
+  const res = await state.library.ignoreSuggestions(ids);
+  return { ...res, stats: state.db.stats() };
+});
+
 // --- 标签 ---------------------------------------------------------------
 
 route('GET', /^\/api\/tags$/, async () => {

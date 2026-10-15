@@ -81,6 +81,7 @@ const S = {
   defaultExportRoot: null,
   scanInterval: 0,
   lastScan: null,
+  suggest: { count: 0, itemCount: 0, groups: [] },
   busy: false,
 };
 let tagSearchTerm = '';
@@ -100,6 +101,9 @@ async function init() {
   }
   $('#boot').hidden = true;
   await Promise.all([refreshTags(), loadItems()]);
+  await refreshSuggestions();
+  // 冷启动时如果文件名里认得出标签，直接问用户一次（这是「自动识别」最主要的时机）
+  if (S.suggest.itemCount) openSuggestions();
 }
 
 async function refreshState() {
@@ -450,6 +454,14 @@ function renderCard(item) {
     tags.appendChild(el('span', 'tagmini none', '待分类'));
   }
   body.appendChild(tags);
+
+  // 文件名里认出了标签候选：卡片上给一条，点了打开确认弹窗
+  if (item.tagSuggest && item.tagSuggest.length) {
+    const hint = el('div', 'sugchip', `文件名像标签：${item.tagSuggest.join('、')} —— 点这里认成标签`);
+    hint.title = '识别到的只是「可能的」标签（有些文件名本来就带连字符），确认后才会真的打上并改名';
+    hint.onclick = (ev) => { ev.stopPropagation(); openSuggestions(); };
+    body.appendChild(hint);
+  }
   card.appendChild(body);
 
   card.onclick = (ev) => {
@@ -510,7 +522,121 @@ function renderSelBar() {
 
 async function afterMutation() {
   await Promise.all([refreshState(), refreshTags()]);
+  await refreshSuggestions();
   await loadItems();
+}
+
+// ------------------------------------------- 从文件名认出旧标签（「tag1-tag2.mp4」）
+//
+// 以前用本工具打过标签、或从别的设备按同样规则命名过的素材，文件名里就带着标签。
+// 但「2024-08-23 直播录屏.mp4」这种名字长得一模一样，程序分不清前两段是标签还是日期，
+// 所以只提建议，采不采纳由用户在弹窗里点。
+
+async function refreshSuggestions() {
+  if (!S.ready) return { count: 0, itemCount: 0, groups: [] };
+  try {
+    S.suggest = await api('/api/suggestions');
+  } catch {
+    S.suggest = { count: 0, itemCount: 0, groups: [] };
+  }
+  renderSuggestChip();
+  return S.suggest;
+}
+
+function renderSuggestChip() {
+  const chip = $('#suggestChip');
+  if (!chip) return;
+  const n = S.suggest ? S.suggest.itemCount : 0;
+  if (!S.ready || !n) { chip.hidden = true; chip.textContent = ''; return; }
+  chip.hidden = false;
+  chip.textContent = `认出 ${n} 个文件名里的标签`;
+  chip.title = '这些素材的文件名长得像「标签1-标签2.扩展名」。点开看要不要认成标签。';
+}
+
+async function openSuggestions() {
+  const data = await refreshSuggestions();
+  const list = $('#sugList');
+  list.innerHTML = '';
+  if (!data.itemCount) {
+    list.appendChild(el('div', 'muted', '没有需要确认的了。'));
+  } else {
+    for (const g of data.groups) {
+      const box = el('div', 'suggroup');
+
+      const head = el('div', 'sughead');
+      const tagWrap = el('div', 'sugtags');
+      for (const t of g.tags) tagWrap.appendChild(el('span', 'tagmini', t));
+      head.appendChild(tagWrap);
+      head.appendChild(el('span', 'muted small', `${g.ids.length} 个素材 · ${humanBytes(g.bytes)}`));
+      box.appendChild(head);
+
+      const items = el('div', 'sugitems');
+      for (const it of g.items) {
+        const row = el('div', 'sugitem');
+        row.appendChild(el('span', 'sugkind', it.kindLabel));
+        const names = el('div', 'sugnames');
+        names.appendChild(el('div', 'sugold', it.origName || it.name));
+        const arrow = el('span', 'sugarrow', '→');
+        const newName = el('span', 'sugnew', it.target);
+        const line = el('div', 'sugnewline');
+        line.append(arrow, newName);
+        names.appendChild(line);
+        row.appendChild(names);
+        items.appendChild(row);
+      }
+      if (g.ids.length > g.items.length) {
+        items.appendChild(el('div', 'muted small', `…另外还有 ${g.ids.length - g.items.length} 个同类素材`));
+      }
+      box.appendChild(items);
+
+      const acts = el('div', 'sugacts');
+      const yes = el('button', 'btn primary tiny', `采纳这 ${g.ids.length} 个`);
+      yes.type = 'button';
+      yes.onclick = () => acceptSuggestion(g, 'group');
+      const no = el('button', 'btn ghost tiny', '这组不用');
+      no.type = 'button';
+      no.onclick = () => ignoreSuggestion(g, 'group');
+      acts.append(yes, no);
+      box.appendChild(acts);
+
+      list.appendChild(box);
+    }
+  }
+  if (!$('#suggestDlg').open) $('#suggestDlg').showModal();
+}
+
+function describeAcceptResult(res) {
+  const parts = [`已认成标签并改名 ${res.accepted} 个`];
+  if (res.skipped) parts.push(`跳过 ${res.skipped} 个`);
+  if (res.failures && res.failures.length) parts.push(`失败 ${res.failures.length} 个`);
+  if (res.droppedTags && res.droppedTags.length) parts.push(`有 ${res.droppedTags.length} 个标签太多塞不进文件名、被去掉了`);
+  if (res.remaining) parts.push(`还剩 ${res.remaining} 组待确认`);
+  return parts.join('，');
+}
+
+async function acceptSuggestion(group, mode) {
+  const body = mode === 'all' ? {} : { ids: group.ids, tags: group.tags };
+  try {
+    const res = await api('/api/suggestions/accept', { method: 'POST', body });
+    toast(describeAcceptResult(res), res.failures && res.failures.length ? 'err' : 'ok');
+    await afterMutation();
+    if (!S.suggest.itemCount) $('#suggestDlg').close();
+    else await openSuggestions();
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+async function ignoreSuggestion(group, mode) {
+  const body = mode === 'all' ? {} : { ids: group.ids };
+  try {
+    await api('/api/suggestions/ignore', { method: 'POST', body });
+    await afterMutation();
+    if (!S.suggest.itemCount) {
+      $('#suggestDlg').close();
+      toast('好，以后不再为这些文件名弹窗（文件没动过）', 'ok');
+    } else {
+      await openSuggestions();
+    }
+  } catch (err) { toast(err.message, 'err'); }
 }
 
 // ---------------------------------------------------------------- 标签编辑器
@@ -900,6 +1026,10 @@ function applyPicked(target, p) {
 // ---------------------------------------------------------------- 事件绑定
 
 function bindEvents() {
+  $('#suggestChip').onclick = () => openSuggestions();
+  $('#sugClose').onclick = () => $('#suggestDlg').close();
+  $('#sugAccept').onclick = () => acceptSuggestion(null, 'all');
+  $('#sugIgnore').onclick = () => ignoreSuggestion(null, 'all');
   // 启动
   $('#bootGo').onclick = bootFromInput;
   $('#bootPath').onkeydown = (ev) => { if (ev.key === 'Enter') bootFromInput(); };
@@ -923,8 +1053,9 @@ function bindEvents() {
     btn.textContent = '扫描中…';
     try {
       const res = await api('/api/scan', { method: 'POST' });
-      toast(`扫描完成：新增 ${res.added}，移除记录 ${res.removed}，改名 ${res.renamed}`, 'ok');
+      toast(`扫描完成：新增 ${res.added}，移除记录 ${res.removed}，改名 ${res.renamed}${res.suggested ? `，认出 ${res.suggested} 组文件名标签` : ''}`, 'ok');
       await afterMutation();
+      if (S.suggest.itemCount) openSuggestions();
     } catch (err) { toast(err.message, 'err'); } finally {
       btn.disabled = false;
       btn.textContent = '重新扫描';
@@ -1078,6 +1209,8 @@ async function boot(root) {
     S.offset = 0;
     await afterMutation();
     msg.textContent = '';
+    // 刚打开的文件夹里如果有「标签1-标签2.ext」这种文件名，弹窗问用户要不要认成标签
+    if (S.suggest.itemCount) openSuggestions();
   } catch (err) {
     msg.className = 'msg err';
     msg.textContent = err.message;
