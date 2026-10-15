@@ -1,0 +1,27 @@
+{
+  "name": "tagstudio",
+  "version": "1.0.0",
+  "private": true,
+  "description": "本地媒体标签管理：多标签分类、按标签浏览、按「标签-uuid.格式」重命名、导出复制到指定文件夹",
+  "type": "commonjs",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "verify": "node verify.js",
+    "verify:quick": "node verify.js --quick",
+    "verify:all": "node verify.js && node probe_external.js && node browser_test.js && node e2e_real.js"
+  },
+  "dependencies": {},
+  "keywords": [
+    "tag",
+    "media",
+    "video",
+    "rename",
+    "export",
+    "local"
+  ],
+  "license": "MIT"
+}

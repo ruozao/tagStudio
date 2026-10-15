@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tagStudio — 本地媒体标签管理</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<div id="boot" class="boot" hidden>
+  <div class="boot-card">
+    <h1>tagStudio</h1>
+    <p class="muted">先选择要分类的素材文件夹（里面放视频 / 音频 / 图片，子文件夹会被递归扫描）。</p>
+    <div class="row">
+      <input id="bootPath" type="text" placeholder="例如 E:\videos 或 E:\workbench\workbench_deepseek\samples" spellcheck="false" />
+      <button id="bootBrowse" class="btn ghost" type="button">浏览…</button>
+      <button id="bootGo" class="btn primary" type="button">打开</button>
+    </div>
+    <p id="bootMsg" class="msg"></p>
+    <p class="muted small">选一个空文件夹也行，程序会自动创建 <code>.mtag</code> 元数据目录和一份「把素材放这里.md」说明。</p>
+  </div>
+</div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">🏷️</span>
+    <div>
+      <div class="title">tagStudio</div>
+      <div id="rootPath" class="path" title="当前素材库根目录">未选择素材库</div>
+    </div>
+  </div>
+  <div class="search-wrap">
+    <input id="search" type="search" placeholder="搜索文件名 / 标签…（回车立即筛选）" spellcheck="false" />
+  </div>
+  <div class="topbar-actions">
+    <select id="kindFilter" title="按类型筛选">
+      <option value="">全部类型</option>
+      <option value="video">视频</option>
+      <option value="audio">音频</option>
+      <option value="image">图片</option>
+      <option value="other">其它</option>
+    </select>
+    <select id="sortSelect" title="排序">
+      <option value="added-desc">最近入库</option>
+      <option value="name-asc">文件名 A→Z</option>
+      <option value="name-desc">文件名 Z→A</option>
+      <option value="mtime-desc">修改时间新→旧</option>
+      <option value="size-desc">体积大→小</option>
+      <option value="size-asc">体积小→大</option>
+      <option value="tags-desc">标签多→少</option>
+      <option value="tags-asc">标签少→多</option>
+    </select>
+    <button id="rescanBtn" class="btn" title="重新扫描素材文件夹">重新扫描</button>
+    <button id="exportBtn" class="btn" title="把选中的素材复制到某个文件夹">导出…</button>
+    <button id="settingsBtn" class="btn ghost" title="设置">⚙</button>
+  </div>
+</header>
+
+<main class="layout">
+  <aside class="sidebar">
+    <section class="panel">
+      <h2>库</h2>
+      <div id="stats" class="stats"></div>
+      <div class="quick">
+        <button class="chip" data-quick="all">全部</button>
+        <button class="chip" data-quick="untagged">未打标签</button>
+        <button class="chip" data-quick="clear">清空筛选</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>合集（常用标签组合）</h2>
+      <div id="collections" class="collections"></div>
+      <button id="newCollection" class="btn tiny ghost">＋ 用当前筛选保存合集</button>
+    </section>
+
+    <section class="panel grow">
+      <h2>
+        标签
+        <span class="muted small" id="tagHint">点标签=叠加筛选</span>
+      </h2>
+      <input id="tagSearch" class="tag-search" type="search" placeholder="过滤标签…" spellcheck="false" />
+      <div id="tagList" class="tag-list"></div>
+    </section>
+  </aside>
+
+  <section class="content">
+    <div class="filterbar">
+      <div id="activeFilters" class="active-filters"></div>
+      <div class="filterbar-right">
+        <span id="countLabel" class="muted small"></span>
+        <button id="selectAllBtn" class="btn tiny ghost">全选本页</button>
+        <button id="clearSelBtn" class="btn tiny ghost">清空选择</button>
+      </div>
+    </div>
+    <div id="grid" class="grid"></div>
+    <div id="empty" class="empty" hidden></div>
+  </section>
+</main>
+
+<section id="selbar" class="selbar" hidden>
+  <div class="selbar-info"><b id="selCount">0</b> 项已选 <span id="selBytes" class="muted"></span></div>
+  <div class="selbar-actions">
+    <input id="bulkTags" type="text" placeholder="批量加标签（逗号分隔）" spellcheck="false" />
+    <button id="bulkAdd" class="btn primary tiny">批量加</button>
+    <input id="bulkRemove" type="text" placeholder="批量移除标签" spellcheck="false" />
+    <button id="bulkRemoveBtn" class="btn tiny">批量移除</button>
+    <button id="selExport" class="btn tiny">导出选中</button>
+    <button id="selClear" class="btn tiny ghost">取消选择</button>
+  </div>
+</section>
+
+<!-- 标签编辑器 -->
+<dialog id="editor" class="dialog">
+  <form method="dialog" class="dialog-body" id="editorForm">
+    <h3 id="editorTitle">编辑标签</h3>
+    <div class="editor-preview" id="editorPreview"></div>
+    <div class="editor-media" id="editorMedia"></div>
+    <label class="field">
+      <span>标签（逗号分隔，也可从下面点选）</span>
+      <input id="editorTags" type="text" autocomplete="off" spellcheck="false" />
+    </label>
+    <div id="editorSuggest" class="suggest"></div>
+    <div id="editorMsg" class="msg"></div>
+    <div class="dialog-actions">
+      <button type="button" id="editorCancel" class="btn ghost">取消</button>
+      <button type="button" id="editorClear" class="btn ghost">清空标签</button>
+      <button type="button" id="editorSave" class="btn primary">保存并重命名</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 设置 -->
+<dialog id="settings" class="dialog">
+  <div class="dialog-body">
+    <h3>设置</h3>
+    <label class="field">
+      <span>素材文件夹（可随时切换，标签跟着各自文件夹走）</span>
+      <div class="row">
+        <input id="setRoot" type="text" spellcheck="false" />
+        <button id="setBrowse" class="btn ghost tiny" type="button">浏览…</button>
+      </div>
+    </label>
+    <div class="kv" id="setInfo"></div>
+    <label class="field">
+      <span>导出目标文件夹（默认在库里 <code>.mtag/exports</code>，也可改成 U 盘/手机可见目录）</span>
+      <input id="setExportRoot" type="text" spellcheck="false" />
+    </label>
+    <div class="dialog-actions">
+      <button id="setClose" class="btn ghost" type="button">关闭</button>
+      <button id="setSave" class="btn primary" type="button">保存并切换</button>
+    </div>
+    <div id="setMsg" class="msg"></div>
+  </div>
+</dialog>
+
+<!-- 导出 -->
+<dialog id="exportDlg" class="dialog wide">
+  <div class="dialog-body">
+    <h3>导出（复制，不动原文件）</h3>
+    <div class="field">
+      <span>导出内容</span>
+      <div id="exportScope" class="scope"></div>
+    </div>
+    <label class="field">
+      <span>目标文件夹</span>
+      <div class="row">
+        <input id="expDest" type="text" spellcheck="false" />
+        <button id="expBrowse" class="btn ghost tiny" type="button">浏览…</button>
+      </div>
+    </label>
+    <label class="field">
+      <span>子目录名（留空自动用「导出-日期-时间」）</span>
+      <input id="expSubdir" type="text" spellcheck="false" />
+    </label>
+    <div class="row wrap">
+      <label class="radio"><input type="radio" name="nameMode" value="tagged" checked /> 标签-uuid.扩展名</label>
+      <label class="radio"><input type="radio" name="nameMode" value="original" /> 原始文件名</label>
+      <label class="radio"><input type="radio" name="nameMode" value="tagged-fresh" /> 标签-新uuid（每次导出换一个新编号）</label>
+      <label class="radio"><input type="checkbox" id="expZip" /> 顺带打一个 zip</label>
+    </div>
+    <div id="expReview" class="kv"></div>
+    <div class="progress"><div id="expBar" class="bar"></div></div>
+    <div id="expLog" class="log"></div>
+    <div id="expResult" class="result"></div>
+    <div class="dialog-actions">
+      <button id="expClose" class="btn ghost" type="button">关闭</button>
+      <button id="expCancel" class="btn ghost" type="button" hidden>取消导出</button>
+      <button id="expStart" class="btn primary" type="button">开始导出</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- 目录浏览器 -->
+<dialog id="browser" class="dialog">
+  <div class="dialog-body">
+    <h3>选择文件夹</h3>
+    <div class="row">
+      <select id="brDrives"></select>
+      <button id="brUp" class="btn ghost tiny" type="button">上一级</button>
+      <button id="brNative" class="btn ghost tiny" type="button">用系统对话框</button>
+    </div>
+    <div id="brPath" class="path"></div>
+    <div id="brList" class="dirlist"></div>
+    <div class="dialog-actions">
+      <button id="brCancel" class="btn ghost" type="button">取消</button>
+      <button id="brPick" class="btn primary" type="button">选这个文件夹</button>
+    </div>
+  </div>
+</dialog>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
