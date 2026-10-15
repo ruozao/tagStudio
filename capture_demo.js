@@ -242,6 +242,32 @@ async function shot(session, name) {
     }
     await shot(session, '01-刚导入还没分类（保留原文件名 + 待分类角标）.png');
 
+    // 01b) 文件名里带着标签时会弹确认框（"别人打过的标签我们能认回来"）。
+    // 真素材的名字里没有连字符，认不出东西，所以临时借两个名字合规的空壳文件
+    // 演一遍这个流程，截完图就连同它们带来的索引一起清掉（下面删 .mtag 重新入库）。
+    const castNames = ['旅行-风景.mp4', '助眠-直播录屏-轻语.mp3'];
+    for (const n of castNames) await fsp.writeFile(path.join(LIB, n), 'x');
+    await request('POST', '/api/scan', {});
+    await evaluate(session, `location.reload()`);
+    await until(async () => await evaluate(session, `document.querySelector('#suggestDlg').open === true`), 20000, 300);
+    await sleep(900);
+    const sugInfo = await evaluate(session, `(() => ({
+      groups: document.querySelectorAll('#suggestDlg #sugList .suggroup').length,
+      tags: [...document.querySelectorAll('#suggestDlg #sugList .tagmini')].map((e) => e.textContent),
+    }))()`);
+    note(`确认弹窗里的标签组合：${sugInfo.tags.join(' / ')}（${sugInfo.groups} 组）`);
+    if (sugInfo.groups < 2) throw new Error(`截图 01b：弹窗没有列出两组候选 → ${JSON.stringify(sugInfo)}`);
+    await shot(session, '01b-文件名里认出旧标签（弹窗让用户选）.png');
+
+    // 收拾这两个演员：删掉文件 + 删库，回到"只有两个真视频、刚入库"的状态
+    for (const n of castNames) await fsp.rm(path.join(LIB, n), { force: true });
+    await fsp.rm(path.join(LIB, '.mtag'), { recursive: true, force: true });
+    await request('POST', '/api/scan', {});
+    items = (await request('GET', '/api/items?limit=50')).json.items;
+    await evaluate(session, `location.reload()`);
+    await until(async () => (await evaluate(session, `document.querySelectorAll('#grid .card').length`)) >= 1, 20000);
+    await sleep(800);
+
     // 现在打标签（等价于在界面上点标签编辑器保存），然后刷新看改名后的样子
     for (let i = 0; i < items.length; i += 1) {
       const r = await request('POST', `/api/items/${items[i].id}/tags`, { tags: plans[i % plans.length], mode: 'set' });
