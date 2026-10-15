@@ -24,9 +24,12 @@
 <header class="topbar">
   <div class="brand">
     <span class="logo">🏷️</span>
-    <div>
+    <div class="brand-main">
       <div class="title">tagStudio</div>
-      <div id="rootPath" class="path" title="当前素材库根目录">未选择素材库</div>
+      <div class="root-row">
+        <button id="rootPath" class="path" type="button" title="当前素材库根目录；点这里换一个文件夹">未选择素材库</button>
+        <select id="rootSelect" class="root-select" title="快速切换到用过的文件夹"></select>
+      </div>
     </div>
   </div>
   <div class="search-wrap">
@@ -139,13 +142,10 @@
 <dialog id="settings" class="dialog">
   <div class="dialog-body">
     <h3>设置</h3>
-    <label class="field">
-      <span>素材文件夹（可随时切换，标签跟着各自文件夹走）</span>
-      <div class="row">
-        <input id="setRoot" type="text" spellcheck="false" />
-        <button id="setBrowse" class="btn ghost tiny" type="button">浏览…</button>
-      </div>
-    </label>
+    <p class="hint">
+      切换素材文件夹在<b>左上角</b>：点路径换目录，右边的下拉框可以直接跳回用过的目录
+      （标签跟着各自的文件夹走，切库不会动上一个库里的任何东西）。
+    </p>
     <div class="kv" id="setInfo"></div>
     <label class="field">
       <span>导出目标文件夹（默认在库里 <code>.mtag/exports</code>，也可改成 U 盘/手机可见目录）</span>
@@ -153,7 +153,7 @@
     </label>
     <div class="dialog-actions">
       <button id="setClose" class="btn ghost" type="button">关闭</button>
-      <button id="setSave" class="btn primary" type="button">保存并切换</button>
+      <button id="setSave" class="btn primary" type="button">保存</button>
     </div>
     <div id="setMsg" class="msg"></div>
   </div>

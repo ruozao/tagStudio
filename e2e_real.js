@@ -221,17 +221,20 @@ async function waitServer(ms) {
   // （记着我这里那两个视频的名字），而对方多半会换成自己的素材。照基准去改名
   // 只会满屏"没找到"。所以先试着匹配，全不中就当基准作废、按当前目录重建。
   await fsp.mkdir(OUT, { recursive: true });
-  const baseline = await loadBaseline();
+  // 用 let：重建基准的分支必须把新基准**赋回** baseline，否则后面收尾那段
+  // 拿到的是 null，会以「Cannot read properties of null (reading 'files')」收场，
+  // 表现就是"跑完了名字没恢复"。这个坑真踩过一次（删掉基准文件后第一次跑）。
+  let baseline = await loadBaseline();
   if (!baseline) {
-    const files = diskFiles(LIB).map(f => ({ name: f.name, size: f.size }));
-    await saveBaseline(files);
-    note(`没有基准文件，按当前状态建了一份：${files.map(f => f.name).join(' | ')}`);
+    baseline = diskFiles(LIB).map(f => ({ name: f.name, size: f.size }));
+    await saveBaseline(baseline);
+    note(`没有基准文件，按当前状态建了一份：${baseline.map(f => f.name).join(' | ')}`);
   } else {
     const noneMatch = baseline.every(w =>
       !diskFiles(LIB).some(f => f.size === w.size));
     if (noneMatch) {
-      const files = diskFiles(LIB).map(f => ({ name: f.name, size: f.size }));
-      await saveBaseline(files);
+      baseline = diskFiles(LIB).map(f => ({ name: f.name, size: f.size }));
+      await saveBaseline(baseline);
       note('基准与实际素材对不上（换了素材？），已按当前目录重建基准');
     } else {
       const touched = resyncBaseline(baseline);

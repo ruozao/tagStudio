@@ -117,17 +117,54 @@ async function refreshState() {
   S.defaultExportRoot = st.defaultExportRoot || null;
   S.scanInterval = st.scanInterval || 0;
   S.lastScan = st.lastScan || null;
+  S.recentRoots = Array.isArray(st.recentRoots) ? st.recentRoots : [];
   renderHeader();
 }
 
 function renderHeader() {
   $('#rootPath').textContent = S.ready ? S.root : '未选择素材库';
-  $('#rootPath').title = S.root || '';
-  if (S.rootMeta) $('#setRoot').value = S.root;
+  $('#rootPath').title = S.ready ? `${S.root}\n点这里换一个素材文件夹` : '点这里选择素材文件夹';
+  renderRootSelect();
   if (!$('#expDest').value) $('#expDest').value = S.defaultExportRoot || '';
   $('#setExportRoot').value = localStorage.getItem('tagstudio.exportRoot') || '';
   $('#settingsBtn').title = S.ffmpeg && S.ffmpeg.path ? `ffmpeg: ${S.ffmpeg.path}` : '未找到 ffmpeg（视频缩略图不可用）';
   renderStats();
+}
+
+/**
+ * 顶栏那个「快速切换到用过的文件夹」下拉框。
+ * 只列服务端记住的、真正打开成功过的目录（存在 config.json 里，重启也还在）。
+ */
+function renderRootSelect() {
+  const sel = $('#rootSelect');
+  if (!sel) return;
+  const recent = (S.recentRoots || []).filter((p) => p);
+  sel.innerHTML = '';
+  const add = (value, label) => {
+    const o = el('option', null, label);
+    o.value = value;
+    o.title = value;
+    sel.appendChild(o);
+  };
+  if (S.ready) add(S.root, `当前：${shortPath(S.root)}`);
+  for (const p of recent) {
+    if (S.ready && pathKey(p) === pathKey(S.root)) continue;
+    add(p, shortPath(p));
+  }
+  add('__pick__', '选择其他文件夹…');
+  sel.value = S.ready ? S.root : '__pick__';
+}
+
+/** 路径比较用：Windows 不区分大小写，末尾的分隔符也不该算差异 */
+function pathKey(p) {
+  return String(p || '').replace(/[\\/]+$/, '').toLowerCase();
+}
+
+/** 下拉框里只显示最后两级目录，太长的路径会把下拉框撑爆 */
+function shortPath(p) {
+  const parts = String(p || '').split(/[\\/]+/).filter(Boolean);
+  if (parts.length <= 2) return p;
+  return '…\\' + parts.slice(-2).join('\\');
 }
 
 function renderStats() {
@@ -1168,6 +1205,8 @@ function renderJob(job) {
 
 let browserTarget = null;
 let browserPath = '';
+// 用目录浏览器选好、但还没确认切换的库目录（确认前不动当前库）
+let pendingRoot = '';
 
 function openBrowser(target, startPath) {
   browserTarget = target;
@@ -1228,7 +1267,7 @@ async function pickNative(target, startPath) {
 
 function applyPicked(target, p) {
   if (target === 'boot') { $('#bootPath').value = p; }
-  else if (target === 'settings') { $('#setRoot').value = p; }
+  else if (target === 'root') { pendingRoot = p; }
   else if (target === 'export') { $('#expDest').value = p; }
   else if (target === 'exportDefault') { $('#setExportRoot').value = p; }
 }
@@ -1345,15 +1384,21 @@ function bindEvents() {
   };
   $('#expClose').onclick = () => { $('#exportDlg').close(); };
 
+  // 顶栏：换素材文件夹 / 快速切换到用过的文件夹
+  $('#rootPath').onclick = () => openBrowser('root', S.root || '');
+  $('#rootSelect').onchange = async (ev) => {
+    const v = ev.target.value;
+    if (v === '__pick__') { openBrowser('root', S.root || ''); return; }
+    if (!v || pathKey(v) === pathKey(S.root)) { renderRootSelect(); return; }
+    await boot(v);
+  };
+
   // 设置
-  $('#setBrowse').onclick = () => openBrowser('settings', $('#setRoot').value || S.root);
-  $('#setSave').onclick = async () => {
-    const root = $('#setRoot').value.trim();
+  $('#setSave').onclick = () => {
     const exportRoot = $('#setExportRoot').value.trim();
     localStorage.setItem('tagstudio.exportRoot', exportRoot);
     if (exportRoot) $('#expDest').value = exportRoot;
-    if (!root || root === S.root) { $('#settings').close(); return; }
-    await boot(root);
+    $('#settings').close();
   };
   $('#setClose').onclick = () => $('#settings').close();
 
@@ -1365,17 +1410,19 @@ function bindEvents() {
       if (res.parent) listDir(res.parent);
     } catch (err) { toast(err.message, 'err'); }
   };
-  $('#brCancel').onclick = () => $('#browser').close();
+  $('#brCancel').onclick = () => { pendingRoot = ''; $('#browser').close(); };
   $('#brPick').onclick = () => {
     if (!browserPath) return;
     applyPicked(browserTarget, browserPath);
     $('#browser').close();
     if (browserTarget === 'boot') bootFromInput();
+    else if (browserTarget === 'root') confirmPendingRoot();
   };
   $('#brNative').onclick = async () => {
     $('#browser').close();
     await pickNative(browserTarget, browserPath);
     if (browserTarget === 'boot' && $('#bootPath').value) bootFromInput();
+    else if (browserTarget === 'root') confirmPendingRoot();
   };
 
   // 快捷键
@@ -1398,7 +1445,6 @@ function bindEvents() {
 }
 
 function renderSettings() {
-  $('#setRoot').value = S.root;
   $('#setExportRoot').value = localStorage.getItem('tagstudio.exportRoot') || '';
   const info = $('#setInfo');
   info.innerHTML = '';
@@ -1416,6 +1462,14 @@ async function bootFromInput() {
   const root = $('#bootPath').value.trim();
   if (!root) { $('#bootMsg').textContent = '请填一个文件夹路径'; return; }
   await boot(root);
+}
+
+/** 顶栏选完文件夹之后：没变就只是把下拉框复位，真换了才切库 */
+async function confirmPendingRoot() {
+  const p = pendingRoot;
+  pendingRoot = '';
+  if (!p || pathKey(p) === pathKey(S.root)) { renderRootSelect(); return; }
+  await boot(p);
 }
 
 async function boot(root) {

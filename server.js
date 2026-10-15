@@ -84,6 +84,17 @@ async function saveConfig(patch) {
   await util.writeJsonAtomic(CONFIG_FILE, state.config);
 }
 
+/**
+ * 记住这个库根目录，供顶栏的下拉框快速切换。
+ * 最新打开的排最前，同一个目录只留一条，最多 10 个 —— 存进 config.json，
+ * 所以关掉程序再打开、甚至重启电脑，这个列表都还在。
+ */
+function rememberRoot(absRoot) {
+  const prev = Array.isArray(state.config.recentRoots) ? state.config.recentRoots : [];
+  const rest = prev.filter((p) => p && path.resolve(p) !== absRoot);
+  return [absRoot, ...rest].slice(0, 10);
+}
+
 /** 库整体挂载/切换。切换是「先建新、成功后再换」，失败不会把已有会话弄坏。 */
 async function mount(root, opts = {}) {
   const absRoot = path.resolve(root);
@@ -136,7 +147,7 @@ async function mount(root, opts = {}) {
   state.lastScan = scan;
   state.ready = true;
 
-  await saveConfig({ lastRoot: absRoot });
+  await saveConfig({ lastRoot: absRoot, recentRoots: rememberRoot(absRoot) });
   scheduleScan();
   if (previousRoot && path.resolve(previousRoot) !== absRoot) {
     // 切换库：旧库的缓存目录跟着旧库走，不需要额外清理
@@ -333,6 +344,9 @@ route('GET', /^\/api\/state$/, async () => {
     ready: state.ready,
     bootError: state.bootError,
     root: state.root,
+    // 顶栏那个「快速切换到用过的文件夹」下拉框的数据
+    recentRoots: (Array.isArray(state.config.recentRoots) ? state.config.recentRoots : [])
+      .filter((p) => typeof p === 'string' && p),
     defaultExportRoot: state.exports ? state.exports.defaultRoot : null,
     rootMeta: state.root ? {
       metaDir: path.join(state.root, util.META_DIRNAME),

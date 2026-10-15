@@ -602,6 +602,26 @@ async function testServer() {
     check('ffmpeg 探测结果被报出来', st.ffmpeg !== undefined);
     note(`ffmpeg: ${st.ffmpeg ? st.ffmpeg : '未找到（视频缩略图会退化成占位图标，不影响打标签与导出）'}`);
 
+    // 顶栏那个「快速切换到用过的文件夹」下拉框靠 recentRoots：最新打开的排最前，重启也还在
+    check('状态里带上了「用过的素材文件夹」列表',
+      Array.isArray(st.recentRoots) && st.recentRoots.some((p) => path.resolve(p) === path.resolve(serverLib)),
+      JSON.stringify(st.recentRoots));
+    const lib2 = path.join(VDIR, 'http-lib2');
+    await fsp.mkdir(lib2, { recursive: true });
+    const postJson = async (p, body) => (await fetch(`${BASE}${p}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })).json();
+    const boot2 = await postJson('/api/library/boot', { root: lib2 });
+    check('能切到另一个素材文件夹', boot2.ok === true, boot2.error);
+    const st2 = await (await fetch(`${BASE}/api/state`)).json();
+    eq('刚打开的文件夹排在历史最前面', path.resolve(st2.recentRoots[0]), path.resolve(lib2));
+    check('上一个文件夹还留在历史里（可以一键跳回去）',
+      st2.recentRoots.some((p) => path.resolve(p) === path.resolve(serverLib)), JSON.stringify(st2.recentRoots));
+    eq('同一个文件夹不会在历史里出现两次',
+      new Set(st2.recentRoots.map((p) => path.resolve(p))).size, st2.recentRoots.length);
+    const bootBack = await postJson('/api/library/boot', { root: serverLib });
+    check('能切回原来的库（后面的断言都基于它）', bootBack.ok === true, bootBack.error);
+
     const css = await httpGet('/styles.css');
     eq('静态样式表可访问', css.status, 200);
     check('样式表 Content-Type 正确', /text\/css/.test(css.headers.get('content-type') || ''), css.headers.get('content-type'));

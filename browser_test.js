@@ -548,8 +548,84 @@ async function main() {
       await evaluate(session, `getComputedStyle(document.querySelector('#selbar')).display`), 'none');
     await shot(session, '06-收尾状态.png');
 
-    // ---------------------------------------------------------- 6. 无报错
-    section('6. 运行期有没有报错');
+    // ---------------------------------------------------------- 6. 顶栏换库入口
+    section('6. 顶栏换素材文件夹 + 快速切换用过的文件夹');
+
+    const rootUi = await evaluate(session, `(() => {
+      const btn = document.querySelector('#rootPath');
+      const sel = document.querySelector('#rootSelect');
+      return {
+        hasBtn: Boolean(btn), hasSel: Boolean(sel),
+        btnVisible: btn ? getComputedStyle(btn).display !== 'none' : false,
+        options: sel ? [...sel.options].map((o) => ({ v: o.value, t: o.textContent })) : [],
+        selected: sel ? sel.value : '',
+        bootRows: document.querySelectorAll('#boot').length,
+      };
+    })()`);
+    check('库路径本身就是一个按钮（点它就是换文件夹）', rootUi.hasBtn && rootUi.btnVisible, JSON.stringify(rootUi));
+    check('路径旁边有一个「用过的文件夹」下拉框', rootUi.hasSel === true, JSON.stringify(rootUi));
+    check('下拉框第一项是当前库、最后一项是「选择其他文件夹…」',
+      rootUi.selected.includes(path.basename(LIBDIR))
+      && rootUi.options.length >= 2
+      && /选择其他文件夹/.test(rootUi.options[rootUi.options.length - 1].t),
+      JSON.stringify(rootUi.options));
+    note(`下拉框：${rootUi.options.map((o) => o.t).join(' / ')}`);
+
+    await evaluate(session, `document.querySelector('#rootPath').click()`);
+    const pickerOpened = await until(async () => await evaluate(session, `document.querySelector('#browser').open === true`), 8000);
+    check('点库路径会打开目录浏览器（原来这个入口藏在设置里）', pickerOpened === true, '目录浏览器没打开');
+    await evaluate(session, `document.querySelector('#brCancel').click()`);
+    await sleep(300);
+
+    // 真换一次库：再造一个小库并打开它（这样它才会被记进「用过的文件夹」），
+    // 刷新页面后下拉框里应该同时有新旧两个库，再用下拉框切回来 —— 走的是用户真会走的那条路。
+    const LIB2 = path.join(VDIR, 'lib2');
+    await fsp.mkdir(LIB2, { recursive: true });
+    await fsp.writeFile(path.join(LIB2, '另一个库里的视频.mp4'), Buffer.alloc(64 * 1024, 3));
+    const boot2 = await fetch(`${BASE}/api/library/boot`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ root: LIB2 }),
+    });
+    check('第二个库能打开（这一步顺带把它登记进 recentRoots）', boot2.ok, `HTTP ${boot2.status}`);
+
+    await evaluate(session, `location.reload()`);
+    const onLib2 = await until(async () => (await evaluate(session, `document.querySelectorAll('#grid .card').length`)) === 1, 25000);
+    check('刷新后页面显示的就是刚打开的那个库（1 个素材）', onLib2 === true,
+      await evaluate(session, `document.querySelectorAll('#grid .card').length`));
+
+    const secondUi = await evaluate(session, `(() => {
+      const sel = document.querySelector('#rootSelect');
+      const same = (v) => v.replace(/[\\\\/]+$/, '').toLowerCase();
+      return {
+        selected: sel.value,
+        hasFirst: [...sel.options].some((o) => same(o.value) === same(${JSON.stringify(LIBDIR)})),
+        options: [...sel.options].map((o) => ({ v: o.value, t: o.textContent })),
+      };
+    })()`);
+    check('下拉框里还能看到上一个库（就是为了快速跳回去）',
+      secondUi.selected.replace(/[\\/]+$/, '').toLowerCase() === LIB2.toLowerCase() && secondUi.hasFirst === true,
+      JSON.stringify(secondUi.options));
+    note(`换库后下拉框：${secondUi.options.map((o) => o.t).join(' / ')}`);
+
+    const back = await evaluate(session, `(() => {
+      const sel = document.querySelector('#rootSelect');
+      const same = (v) => v.replace(/[\\\\/]+$/, '').toLowerCase();
+      // 必须按完整路径比，不能只比 'lib' 这种子串：lib2 里也含 'lib'，
+      // 那样会误选中"当前这一项"，切换压根不会发生（这个坑真踩过一次）。
+      const o = [...sel.options].find((x) => same(x.value) === same(${JSON.stringify(LIBDIR)}));
+      if (!o) return null;
+      sel.value = o.value;
+      sel.dispatchEvent(new Event('change'));
+      return o.value;
+    })()`);
+    check('在下拉框里选中上一个库并触发了切换', Boolean(back), '下拉框里没找到上一个库');
+    const backOk = await until(async () => (await evaluate(session, `document.querySelectorAll('#grid .card').length`)) === 3, 25000);
+    check('用下拉框切回来之后，列表恢复成 3 张卡', backOk === true,
+      await evaluate(session, `document.querySelectorAll('#grid .card').length`));
+    note(`切回来后：${await evaluate(session, `document.querySelector('#rootPath').textContent.trim()`)}`);
+    await shot(session, '07-顶栏快速切换素材文件夹.png');
+
+    // ---------------------------------------------------------- 7. 无报错
+    section('7. 运行期有没有报错');
     check('页面没有未捕获异常', pageErrors.length === 0, pageErrors.slice(0, 3).join(' ｜ '));
     check('控制台没有 error 级日志', consoleErrors.length === 0, consoleErrors.slice(0, 3).join(' ｜ '));
     const mediaFails = failedRequests.filter((f) => !/image|other/i.test(f));
