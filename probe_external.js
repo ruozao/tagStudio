@@ -76,14 +76,19 @@ function request(method, p, body) {
   try {
     check('服务起来了', await up());
 
-    section('1. 首次扫描：外部文件被整理成 未分类-uuid.扩展名');
+    section('1. 首次扫描：还没打标签，所以外部文件保持原文件名');
     const sc = await request('POST', '/api/scan', {});
     eq('扫描成功', sc.status, 200);
     let list = (await request('GET', '/api/items?limit=50')).json;
     eq('库里 3 个素材', list.total, 3);
     for (const it of list.items) note(`${it.name}`);
-    check('全部是 未分类-<uuid>.扩展名 形式', list.items.every(i => /^未分类-[0-9a-f]{32}\./.test(i.name)),
+    check('还没打标签的素材保持原文件名（不改名，方便照着原名想标签）',
+      ['素材甲.mp4', '素材乙.mp3', '素材丙.png'].every(n => list.items.some(i => i.name === n)),
       list.items.map(i => i.name).join(' | '));
+    check('没打标签时不会出现 uuid（否则会被误认为本工具已经整理过）',
+      list.items.every(i => !/[0-9a-f]{32}/i.test(i.name)), list.items.map(i => i.name).join(' | '));
+    check('但库里能一眼看出这三个都还没打标签',
+      list.items.every(i => i.tags.length === 0 && i.inferred === false), JSON.stringify(list.items.map(i => i.tags)));
 
     section('2. 打标签后再手动改名（模拟用户在资源管理器里动手）');
     const first = list.items.find(i => i.kind === 'video');

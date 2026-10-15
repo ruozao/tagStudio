@@ -322,12 +322,23 @@ async function main() {
       ['视频', '音频', '图片'].every((k) => kinds.includes(k)), JSON.stringify(kinds));
 
     const names = await evaluate(session, `[...document.querySelectorAll('#grid .card .name')].map(n => n.textContent)`);
-    check('未打标签的素材被整理成「未分类-uuid.扩展名」',
-      names.length === 3 && names.every((n) => /^未分类-[0-9a-f]{32}\./.test(n)), JSON.stringify(names));
+    check('还没打标签的素材在界面上显示原文件名（不改名，方便照着原名想标签）',
+      names.length === 3 && ['一首歌.mp3', '演示片段.mp4', '一张图.png'].every((n) => names.includes(n)), JSON.stringify(names));
+    check('没打标签时文件名里不会冒出 uuid',
+      names.every((n) => !/[0-9a-f]{32}/i.test(n)), JSON.stringify(names));
     note(`文件名：${names.join(' | ')}`);
 
     const audioPh = await evaluate(session, `document.querySelectorAll('#grid .card .thumb .ph').length`);
     check('音频卡用占位图标（不发缩略图请求）', audioPh >= 1, `占位图标 ${audioPh} 个`);
+
+    // 还没打标签的卡要有显眼的「待分类」标记：这类素材文件名没被改过，
+    // 光看文件名看不出"进库了没有"，必须靠角标告诉他们"这条还没处理"。
+    const pending = await evaluate(session, `[...document.querySelectorAll('#grid .card .badge.pending')].map(b => b.textContent)`);
+    check('没打标签的卡都带「待分类」角标', pending.length === 3 && pending.every((t) => t === '待分类'), JSON.stringify(pending));
+    const pendingChip = await evaluate(session, `[...document.querySelectorAll('#grid .card .tagmini.none')].map(b => b.textContent)`);
+    check('卡片标签行也标着「待分类」', pendingChip.length === 3 && pendingChip.every((t) => t === '待分类'), JSON.stringify(pendingChip));
+    const origLines = await evaluate(session, `document.querySelectorAll('#grid .card .origname').length`);
+    check('还没改名时不用重复显示原始文件名那一行', origLines === 0, `${origLines} 行`);
 
     await shot(session, '01-列表.png');
 
@@ -371,6 +382,34 @@ async function main() {
     `), 20000);
     check('保存后卡片上的文件名变成了「标签-uuid.扩展名」', saved === true,
       await evaluate(session, `[...document.querySelectorAll('#grid .card .name')].map(x => x.textContent).join(' | ')`));
+
+    // 改名之后，卡片上要再显示一行入库时的原始文件名 —— 否则用户只能看到一串 uuid
+    const origShown = await until(async () => {
+      const t = await evaluate(session, `[...document.querySelectorAll('#grid .card .origname')].map(x => x.textContent)`);
+      return t.some((s) => /\.mp4$/.test(s) && !/[0-9a-f]{32}/i.test(s));
+    }, 8000);
+    check('改名后卡片上多出「入库时的原始文件名」这一行', origShown === true,
+      JSON.stringify(await evaluate(session, `[...document.querySelectorAll('#grid .card .origname')].map(x => x.textContent)`)));
+    const stillPending = await evaluate(session, `document.querySelectorAll('#grid .card .badge.pending').length`);
+    eq('打上标签的那张卡不再是「待分类」', stillPending, 2);
+
+    // 再打开一次编辑器：标题已经是「标签-uuid.扩展名」，里面要能看到入库时的原名
+    await evaluate(session, `(async () => {
+      const cards = [...document.querySelectorAll('#grid .card')];
+      const c = cards.find(x => (x.querySelector('.name').textContent || '').includes('海边的日落'));
+      if (c) c.click();
+    })()`);
+    const reopened = await until(async () => await evaluate(session, `document.querySelector('#editor').open === true`), 10000);
+    check('能再次打开已改名的素材', reopened === true);
+    const editorOrig = await evaluate(session, `(() => {
+      const e = document.querySelector('#editorOrig');
+      return { hidden: e.hidden, text: e.textContent.trim() };
+    })()`);
+    check('编辑器里显示了原始文件名（标题已被改成 标签-uuid 了）',
+      editorOrig.hidden === false && /\.mp4$/.test(editorOrig.text) && !/[0-9a-f]{32}/i.test(editorOrig.text),
+      JSON.stringify(editorOrig));
+    await evaluate(session, `document.querySelector('#editorCancel').click()`);
+    await until(async () => await evaluate(session, `document.querySelector('#editor').open === false`), 8000);
 
     const diskNames = await fsp.readdir(LIBDIR).catch(() => []);
     const renamed = diskNames.filter((n) => n.startsWith('旅行-海边的日落-') || n.startsWith('海边的日落-旅行-'));
@@ -416,6 +455,12 @@ async function main() {
       return true;
     })()`);
     void searchHit;
+
+    // 改名之后还能靠"入库时的原始文件名"搜到 —— 这是用户真正记得住的那个名字
+    const searchByOrig = await until(async () =>
+      (await evaluate(session, `document.querySelectorAll('#grid .card').length`)) === 1, 15000);
+    check('按原始文件名搜索能搜到（该素材已经被改名成 标签-uuid 了）', searchByOrig === true,
+      await evaluate(session, `[...document.querySelectorAll('#grid .card .name')].map(x => x.textContent).join(' | ')`));
 
     // ---------------------------------------------------------- 5. 批量 + 导出
     section('5. 勾选素材 → 批量打标签 → 导出');

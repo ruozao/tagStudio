@@ -99,7 +99,10 @@
 </main>
 
 <section id="selbar" class="selbar" hidden>
-  <div class="selbar-info"><b id="selCount">0</b> 项已选 <span id="selBytes" class="muted"></span></div>
+  <div class="selbar-info">
+    <b id="selCount">0</b> 项已选 <span id="selBytes" class="muted"></span>
+    <span id="selOrig" class="selbar-orig" hidden></span>
+  </div>
   <div class="selbar-actions">
     <input id="bulkTags" type="text" placeholder="批量加标签（逗号分隔）" spellcheck="false" />
     <button id="bulkAdd" class="btn primary tiny">批量加</button>
@@ -114,6 +117,7 @@
 <dialog id="editor" class="dialog">
   <form method="dialog" class="dialog-body" id="editorForm">
     <h3 id="editorTitle">编辑标签</h3>
+    <div id="editorOrig" class="origname" hidden></div>
     <div class="editor-preview" id="editorPreview"></div>
     <div class="editor-media" id="editorMedia"></div>
     <label class="field">

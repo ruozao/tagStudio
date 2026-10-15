@@ -139,10 +139,18 @@ async function testNaming() {
   eq('34 位 uuid 完整保留', naming.parseIdFromName(b1.name), id);
   eq('反解标签一致', JSON.stringify(naming.parseTagsFromName(b1.name)), JSON.stringify(['助眠', '美食']));
 
-  const b2 = naming.buildName({ id, originalName: 'a.mp3', tags: [] });
-  eq('没有标签 → 用「未分类」占位，保证 id 仍在文件名里', b2.name, `未分类-${id}.mp3`);
-  eq('「未分类」是占位符，反解回来必须还是 0 个标签（否则未分类素材会背着一个假标签）', JSON.stringify(naming.parseTagsFromName(b2.name)), JSON.stringify([]));
+  const b2 = naming.buildName({ id, originalName: '2024-08-23 直播录屏.mp3', tags: [] });
+  eq('没有标签 → 保持原文件名不动（用户要靠原名判断该打什么标签）', b2.name, '2024-08-23 直播录屏.mp3');
+  eq('原名里没有 uuid，所以反解不出东西（未打标签时本来就不需要 uuid）', naming.parseTagsFromName(b2.name), null);
   eq('tagged 标记为 false', b2.tagged, false);
+  const b2b = naming.buildName({ id, originalName: '', tags: [] });
+  eq('原名是空的极端情况 → 退回 uuid，至少还有个合法名字', b2b.name, id);
+  const b2c = naming.buildName({ id, originalName: '子目录/歌.mp3', tags: [] });
+  eq('原名带目录时只取文件名本体（目录由 rel 负责）', b2c.name, '歌.mp3');
+
+  // 从"有标签"退回"没标签"：应当回到入库时的原名（transformer 传进来的就是 origName）
+  const b2d = naming.buildName({ id, originalName: '旧手机导出的照片.jpg', tags: [] });
+  eq('清空标签后回到原名', b2d.name, '旧手机导出的照片.jpg');
 
   const b3 = naming.buildName({ id, originalName: 'x.webm', tags: ['A', 'b', 'C'] });
   eq('标签排序大小写不敏感（A → b → C）', b3.name, `A-b-C-${id}.webm`);
@@ -214,8 +222,12 @@ async function testLibraryScanAndRename() {
 
   const untaggedNames = disk1.filter((n) => n.endsWith('.mp4') || n.endsWith('.mp3') || n.endsWith('.PNG'));
   eq('三个素材都还在', untaggedNames.length, 3);
-  check('未打标签的素材被整理成「未分类-uuid.扩展名」', untaggedNames.every((n) => /^未分类-[0-9a-f]{32}\.(mp4|mp3|PNG)$/.test(path.basename(n))), untaggedNames.join(' | '));
-  check('原始文件名里的空格与中文没有破坏 uuid 解析', untaggedNames.every((n) => !!naming.parseIdFromName(n)));
+  check('未打标签的素材保持原文件名不动（用户要靠原名判断该打什么标签）',
+    ['a 原始视频.mp4', 'b 音乐.mp3', 'c 图片.PNG'].every((n) => untaggedNames.some((x) => path.basename(x) === n)),
+    untaggedNames.join(' | '));
+  check('没打标签时不会被塞进 uuid（也就不会被误当成「本工具已经整理过」的文件）',
+    untaggedNames.every((n) => naming.parseIdFromName(n) === null), untaggedNames.join(' | '));
+  check('库里能认出这三个还没打标签的素材', db.query({ untagged: true }).total === 3, `未打标签 ${db.query({ untagged: true }).total} 个`);
 
   // 打标签 → 应当就地改名
   const video = db.items().find((i) => i.kind === 'video');
@@ -290,7 +302,7 @@ async function testLibraryScanAndRename() {
   eq('OR 查询', db.query({ any: ['助眠', '不存在'] }).total, 2);
   eq('未打标签', db.query({ untagged: true }).total, 1);
   eq('按类型', db.query({ kind: 'image' }).total, 1);
-  eq('关键词搜文件名', db.query({ q: '未分类' }).total, 1);
+  eq('关键词搜文件名（搜的是还没打标签、保留原名的那个素材）', db.query({ q: 'c 图片' }).total, 1);
   eq('关键词搜标签', db.query({ q: '助眠' }).total, 2);
   eq('标签计数', db.tagList().find((t) => t.name === '助眠').count, 2);
 
@@ -437,7 +449,16 @@ async function testExport() {
   const destNames = listDisk(path.join(DEST, '给手机'));
   const mediaNames = destNames.filter((n) => !n.includes('manifest') && !n.endsWith('.zip'));
   eq('目标目录里的媒体文件数', mediaNames.length, items.length);
-  check('导出的文件名就是「标签-uuid.扩展名」', mediaNames.every((n) => /^[^-]+(-[^-]+)*-[0-9a-f]{32}\.[A-Za-z0-9]+$/.test(path.basename(n))), mediaNames.join(' | '));
+  // 打了标签的素材：名字就是「标签-uuid.扩展名」；没打标签的保持原名
+  const taggedItems = items.filter((i) => (i.tags || []).length);
+  const untaggedItems = items.filter((i) => !(i.tags || []).length);
+  const expectedTaggedName = (i) => naming.buildName({ id: i.id, originalName: i.name, tags: i.tags }).name;
+  check('打了标签的素材，导出名就是「标签-uuid.扩展名」',
+    taggedItems.length > 0 && taggedItems.every((i) => mediaNames.some((n) => path.basename(n) === expectedTaggedName(i))),
+    taggedItems.map(expectedTaggedName).join(' | '));
+  check('没打标签的素材，导出时保持原文件名（不会莫名其妙变成一串 uuid）',
+    untaggedItems.every((i) => mediaNames.some((n) => path.basename(n) === path.basename(i.origName || i.name))),
+    untaggedItems.map((i) => i.origName || i.name).join(' | '));
   check('清单 CSV 存在', destNames.includes('manifest.csv'));
   check('清单 JSON 存在', destNames.includes('manifest.json'));
   check('zip 存在', destNames.some((n) => n.endsWith('.zip')));
@@ -593,8 +614,15 @@ async function testServer() {
     const list = await (await fetch(`${BASE}/api/items`)).json();
     eq('列表接口返回 2 个素材', list.items.length, 2);
     check('每项都带了缩略图/播放/下载地址', list.items.every((i) => i.thumbUrl && i.url && i.downloadUrl && i.sizeText && i.kindLabel));
+    // 界面三处（卡片 / 标签编辑器 / 批量面板）都要靠这两个字段把"这原本是哪个文件"显示出来
+    check('每项都带了入库时的原始文件名 origName',
+      list.items.every((i) => typeof i.origName === 'string' && i.origName.length > 0), JSON.stringify(list.items.map((i) => i.origName)));
+    check('每项都带了 untagged 标记（界面据此显示「待分类」）',
+      list.items.every((i) => typeof i.untagged === 'boolean'), JSON.stringify(list.items.map((i) => i.untagged)));
 
     const vid = list.items.find((i) => i.kind === 'video');
+    eq('还没打标签时 origName 就是当前文件名', vid.origName, vid.name);
+    eq('还没打标签时 untagged 为 true', vid.untagged, true);
 
     // 端到端打标签：HTTP → 磁盘文件名
     const tagged = await (await fetch(`${BASE}/api/items/${vid.id}/tags`, {
@@ -605,6 +633,15 @@ async function testServer() {
     check('打标签接口返回成功', tagged.ok === true, tagged.error);
     eq('磁盘上的文件名已随之改变', tagged.item.name, `开场-片头-${vid.id}.mp4`);
     check('磁盘上确实有这个文件', fs.existsSync(path.join(serverLib, tagged.item.name)));
+
+    // 改名之后，原始文件名必须还能查到 —— 这是用户"认得出哪个是哪个"的唯一线索
+    eq('改名后 origName 仍然是入库时的原名', tagged.item.origName, '片头.mp4');
+    eq('改名后 untagged 变成 false', tagged.item.untagged, false);
+    const byOrig = await (await fetch(`${BASE}/api/items?q=${encodeURIComponent('片头')}`)).json();
+    check('按原始文件名搜索能搜到（即使它已经被改名成 标签-uuid.mp4）',
+      byOrig.items.some((i) => i.id === vid.id), JSON.stringify(byOrig.items.map((i) => i.name)));
+    const byOrig2 = await (await fetch(`${BASE}/api/items?q=${encodeURIComponent('片头.mp4')}`)).json();
+    eq('搜完整的原始文件名也命中', byOrig2.items.length, 1);
 
     const bad = await fetch(`${BASE}/api/items/${vid.id}/tags`, {
       method: 'POST',
@@ -714,7 +751,7 @@ async function testServer() {
     eq('重新扫描发现新增', scanRes.added, 1);
     const after = await (await fetch(`${BASE}/api/items`)).json();
     eq('列表里有 3 个素材', after.items.length, 3);
-    check('新素材也被整理成未分类名', after.items.some((i) => /^未分类-[0-9a-f]{32}\.MP4$/.test(i.name)));
+    check('新加进来的素材没打标签，所以保持原文件名', after.items.some((i) => i.name === '新来的.MP4' && (i.tags || []).length === 0));
 
     // 全局改标签：走 HTTP
     const renamed = await (await fetch(`${BASE}/api/tags/rename`, {
@@ -800,8 +837,12 @@ async function testRealVideos() {
   eq('复制的字节数与源文件总量一致', final.bytesDone, totalSrc);
   for (const item of db.items()) {
     const src = fs.statSync(db.absOf(item)).size;
-    const dst = fs.statSync(path.join(final.destDir, item.name)).size;
-    check(`${item.name} 复制后大小一致`, src === dst, `${src} vs ${dst}`);
+    // 导出名要走 exporter 的规则算一遍，别拿 item.name 硬套：
+    // 打了标签的两种模式可能不一致（tagged-fresh 会换 uuid），没打标签的则保持原名。
+    const exported = job.exportName(item);
+    const dstPath = path.join(final.destDir, exported);
+    const dst = fs.existsSync(dstPath) ? fs.statSync(dstPath).size : -1;
+    check(`${exported} 复制后大小一致`, src === dst, `${src} vs ${dst}`);
   }
   note(`复制 ${util.humanBytes(totalSrc)} 耗时 ${Math.round((Date.now() - t1) / 1000)} 秒`);
 }

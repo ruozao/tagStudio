@@ -5,7 +5,7 @@
  *
  * 它做这些事，每步都断言：
  *   1. 直接以 <项目>/素材 为素材库启动服务
- *   2. 扫描：两个大视频入库，被整理成 未分类-uuid.mp4
+ *   2. 扫描：两个大视频入库，此时还没打标签，所以文件名保持原样
  *   3. 用 ffmpeg 抽视频缩略图，并确认抽出来的是**能解码的 JPEG**（不是 0 字节、不是报错页）
  *   4. 打标签 → 磁盘文件名变成 标签1-标签2-uuid.mp4，扩展名不变
  *   5. 按标签筛选能各自看到对应视频
@@ -61,12 +61,13 @@ async function loadBaseline() {
  * 返回 {repaired:[], unknown:[]}，unknown 是基准里没有的新文件。
  */
 async function repairFixture(baseline) {
+  resyncBaseline(baseline);   // 先按名字把「大小变了但不是被改名」的条目刷新一下
   const now = fs.readdirSync(LIB, { withFileTypes: true })
     .filter(e => e.isFile() && !e.name.startsWith('.'))
     .map(e => ({ name: e.name, size: fs.statSync(path.join(LIB, e.name)).size }));
   const repaired = [];
   const unknown = [];
-  for (const want of baseline) {
+  for (const want of (baseline.files || baseline)) {
     if (now.some(f => f.name === want.name && f.size === want.size)) continue;  // 已经是基准名
     const cands = now.filter(f => f.size === want.size && f.name !== want.name);
     if (cands.length === 1) {
@@ -79,23 +80,35 @@ async function repairFixture(baseline) {
       unknown.push(`${want.name}（大小 ${want.size}）有 ${cands.length} 个候选，分不清`);
     }
   }
-  // 基准里没登记的杂项：这次跑下来只可能是被改了名的说明文档（未分类-<uuid>.md）。
-  // 它本来就不该被改名，收尾时按扩展名认回来。只认 .md，不去动用户的其它文件。
+  // 基准里没登记的杂项：不动它，只记下来。基准是按「大小」配对的，所以
+  // 就算某个文件被改成了「标签-uuid.扩展名」，上面的循环也能按大小认回来。
   for (const f of now) {
-    if (baseline.some(w => w.name === f.name)) continue;
-    if (f.name.startsWith('未分类-') && /\.md$/i.test(f.name)) {
-      const target = baseline.find(w => /\.md$/i.test(w.name));
-      if (target) {
-        await fsp.rename(path.join(LIB, f.name), path.join(LIB, target.name));
-        repaired.push(`${f.name} → ${target.name}`);
-      }
-    }
+    if ((baseline.files || baseline).some(w => w.name === f.name)) continue;
+    unknown.push(`${f.name}（大小 ${f.size}）不在基准里`);
   }
   return { repaired, unknown };
 }
 
-async function saveBaseline(files) {
-  await fsp.mkdir(path.dirname(BASELINE), { recursive: true });
+/**
+ * 基准条目是按「大小」配对的，所以你只要编辑过素材目录里那个说明文档（大小变了），
+ * 基准就对不上它了。这里先按**文件名**把大小刷一遍：名字还一样、只是大小变了，
+ * 说明是你自己改了内容，不是被程序改了名，直接更新基准即可。
+ * 返回被刷新过的条目描述。
+ */
+function resyncBaseline(baseline) {
+  const now = diskFiles(LIB);
+  const touched = [];
+  for (const w of baseline.files || baseline) {
+    const same = now.find(f => f.name === w.name);
+    if (same && same.size !== w.size) {
+      touched.push(`${w.name}（${w.size} → ${same.size}）`);
+      w.size = same.size;
+    }
+  }
+  return touched;
+}
+
+async function saveBaseline(files) {  await fsp.mkdir(path.dirname(BASELINE), { recursive: true });
   await fsp.writeFile(BASELINE, JSON.stringify({
     note: 'e2e_real.js 的夹具基准：素材目录里每个文件原本的名字与大小',
     createdAt: new Date().toISOString(),
@@ -221,6 +234,11 @@ async function waitServer(ms) {
       await saveBaseline(files);
       note('基准与实际素材对不上（换了素材？），已按当前目录重建基准');
     } else {
+      const touched = resyncBaseline(baseline);
+      if (touched.length) {
+        await saveBaseline(baseline.files || baseline);
+        note(`基准里这些条目的大小已按磁盘刷新：${touched.join(' | ')}`);
+      }
       const { repaired, unknown } = await repairFixture(baseline);
       if (repaired.length) {
         section('0. 开跑前复位素材名（上一次跑留下的改名）');
@@ -284,7 +302,7 @@ async function waitServer(ms) {
     note(`命名字节预算 ${s.thresholds.nameBudgetBytes}，标签最长 ${s.thresholds.maxTagChars}，绝对路径上限 ${s.thresholds.maxAbsPathChars}`);
 
     // ── 2. 扫描 ───────────────────────────────────────────────────────────
-    section('2. 扫描 → 两个视频入库并被整理成 未分类-uuid.mp4');
+    section('2. 扫描 → 两个视频入库，但还没打标签所以保持原文件名');
     const scan = await api.post('/api/scan');
     eq('POST /api/scan 200', scan.status, 200);
     note(`扫到 ${scan.json.filesOnDisk} 个文件，新增 ${scan.json.added}，改名 ${scan.json.renamed}`);
@@ -299,8 +317,8 @@ async function waitServer(ms) {
       note(`${it.kind} · ${it.name} · ${it.sizeText}`);
       const orig = originalBySize.get(it.size);
       if (orig) uuidMap[orig] = it.id;
-      check(`「${it.name}」未打标签时用 未分类-<32位uuid>.mp4 形式`,
-        /^未分类-[0-9a-f]{32}\.mp4$/.test(it.name), it.name);
+      check(`「${it.name}」未打标签时保持原文件名（不改名，方便照着原名想标签）`,
+        it.name === path.basename(it.origName || it.name) && !/[0-9a-f]{32}/i.test(it.name), it.name);
       eq(`「${it.id}」扩展名没被改动`, path.extname(it.name).toLowerCase(), '.mp4');
     }
 
@@ -319,7 +337,7 @@ async function waitServer(ms) {
 
     // ── 4. Range（拖动进度条的前提）───────────────────────────────────────
     section('4. 媒体流支持 Range（拖动播放位置）');
-    const mid = items[0].id;
+    const mid = videos[0].id;   // 要用视频：items 是按 rel 排序的，第一个可能是素材目录里的说明文档
     const full = await api.get(`/api/media/${mid}`);
     eq('完整请求 200', full.status, 200);
     eq('声明了 Accept-Ranges', full.headers['accept-ranges'], 'bytes');
@@ -356,11 +374,21 @@ async function waitServer(ms) {
 
     const diskAfterTag = mediaOnDisk(LIB);
     eq(`磁盘上还是 ${items.length} 个素材文件（没多出副本）`, diskAfterTag.length, items.length);
+    // 重新取一次列表：上面的 items 是"打标签之前"的快照，里面每个素材的 tags 都还是空的，
+    // 拿它判断"这个文件打过标签没有"会全部判成没打过。这个坑踩过一次。
+    const afterTag = (await api.get('/api/items?limit=100')).json.items;
+    // 打标签会改名，rel 跟着变，所以按 id 配对。
+    const taggedIds = new Set(afterTag.filter(i => (i.tags || []).length).map(i => i.id));
     for (const f of diskAfterTag) {
-      // 视频：标签-uuid.mp4；剩下的说明文档没打标签，应该是 未分类-uuid.md
-      check(`磁盘文件名符合 标签-uuid.扩展名 规范：${f.name}`,
-        /^[^\\/:*?"<>|]+(-[^\\/:*?"<>|]+)*-[0-9a-f]{32}(\.[^.]+)?$/i.test(f.name),
-        f.name);
+      const rec = afterTag.find(i => path.basename(i.rel) === f.name || path.basename(i.name) === f.name);
+      const tagged = !!(rec && taggedIds.has(rec.id));
+      if (tagged) {
+        check(`「${f.name}」打过标签后是 标签-uuid.扩展名 规范名`,
+          /^[^\\/:*?"<>|]+(-[^\\/:*?"<>|]+)*-[0-9a-f]{32}(\.[^.]+)?$/i.test(f.name),
+          f.name);
+      } else {
+        check(`「${f.name}」没打标签所以没被改名`, !/[0-9a-f]{32}/i.test(f.name), f.name);
+      }
     }
 
     // ── 6. 按标签浏览 ─────────────────────────────────────────────────────
@@ -408,8 +436,8 @@ async function waitServer(ms) {
     eq(`整库导出包含全部 ${items.length} 个素材（含素材目录里的说明文档）`, wj.done, items.length);
       const wl = diskFiles(wj.destDir).filter(f => /\.mp4$/i.test(f.name));
       note(`整库导出（原始文件名模式）：${wl.map(f => f.name).join(' | ')}`);
-      check('原始文件名模式下导出的是复制进来时的原名（不是 未分类-uuid）',
-        wl.every(f => !/未分类-/.test(f.name)), wl.map(f => f.name).join(' | '));
+      check('原始文件名模式下导出的是复制进来时的原名（不是 标签-uuid、也不是 未分类-uuid）',
+        wl.length > 0 && wl.every(f => !/[0-9a-f]{32}/i.test(f.name) && !f.name.startsWith('未分类-')), wl.map(f => f.name).join(' | '));
     }
 
     const started = await api.post('/api/export/start', { destRoot: dest1, subdir: '晚安', nameMode: 'tagged', makeZip: false });

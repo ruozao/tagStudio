@@ -409,6 +409,10 @@ function renderCard(item) {
     thumb.appendChild(img);
   }
   thumb.appendChild(el('div', 'badge', item.kindLabel));
+  // 还没打标签的素材：在缩略图上再盖一个显眼的「待分类」角标。
+  // 这类素材的文件名没被改过（还是用户原来的名字），所以单看文件名看不出"进库了没有"，
+  // 需要这个角标告诉他们"这条还没处理"。
+  if (!item.tags.length) thumb.appendChild(el('div', 'badge pending', '待分类'));
   const check = el('div', 'check', '✓');
   check.title = '勾选（用于批量打标签 / 导出）';
   check.onclick = (ev) => { ev.stopPropagation(); toggleSelect(item.id, ev.shiftKey); };
@@ -419,6 +423,15 @@ function renderCard(item) {
   const name = el('div', 'name', item.name);
   name.title = `${item.rel}\n${item.sizeText}`;
   body.appendChild(name);
+
+  // 打过标签之后 name 已经是「标签-uuid.扩展名」了，把入库时的原名再显示一行。
+  // 没打标签时 name 就是原名，不用重复显示。
+  const orig = String(item.origName || '');
+  if (orig && orig !== item.name) {
+    const origEl = el('div', 'origname', orig);
+    origEl.title = '入库时的原始文件名（不会被改掉，导出时可选「原始文件名」模式）';
+    body.appendChild(origEl);
+  }
 
   const meta = el('div', 'meta');
   meta.appendChild(el('span', null, item.sizeText));
@@ -434,7 +447,7 @@ function renderCard(item) {
       tags.appendChild(chip);
     }
   } else {
-    tags.appendChild(el('span', 'tagmini none', '未打标签'));
+    tags.appendChild(el('span', 'tagmini none', '待分类'));
   }
   body.appendChild(tags);
   card.appendChild(body);
@@ -475,8 +488,24 @@ function renderSelBar() {
   if (!S.selection.size) { bar.hidden = true; return; }
   bar.hidden = false;
   $('#selCount').textContent = String(S.selection.size);
-  const bytes = S.items.filter((i) => S.selection.has(i.id)).reduce((n, i) => n + (i.size || 0), 0);
+  const chosen = S.items.filter((i) => S.selection.has(i.id));
+  const bytes = chosen.reduce((n, i) => n + (i.size || 0), 0);
   $('#selBytes').textContent = `/ 本页已知 ${humanBytes(bytes)}（翻页的选择也会一起处理）`;
+
+  // 批量面板也要看得见"这些原本是哪个文件"：打了标签之后卡片上显示的是
+  // 「标签-uuid.扩展名」，一次选了十几个就分不清谁是谁了。
+  const origEl = $('#selOrig');
+  const names = chosen.map((i) => String(i.origName || i.name)).filter(Boolean);
+  if (!names.length) {
+    origEl.hidden = true;
+  } else {
+    const shown = names.slice(0, 3).join(' | ');
+    origEl.textContent = names.length > 3
+      ? `原名：${shown} …等 ${names.length} 个`
+      : `原名：${shown}`;
+    origEl.title = names.join('\n');
+    origEl.hidden = false;
+  }
 }
 
 async function afterMutation() {
@@ -493,6 +522,17 @@ async function openEditor(item) {
   editorItem = item;
   const dlg = $('#editor');
   $('#editorTitle').textContent = item.name;
+  // 改过名之后标题就是一串「标签-uuid.扩展名」了，这里补一行入库时的原名。
+  const origEl = $('#editorOrig');
+  const orig = String(item.origName || '');
+  if (orig && orig !== item.name) {
+    origEl.textContent = `原始文件名：${orig}`;
+    origEl.title = '入库时的原始文件名，导出时可以选「原始文件名」模式用它';
+    origEl.hidden = false;
+  } else {
+    origEl.textContent = '';
+    origEl.hidden = true;
+  }
   $('#editorTags').value = item.tags.join(', ');
   $('#editorMsg').textContent = '';
   $('#editorMsg').className = 'msg';

@@ -143,6 +143,10 @@ async function shot(session, name) {
 (async () => {
   console.log('tagStudio —— 用真实素材截图\n');
 
+  // 先清掉上一轮的截图：文件名带序号，重命名过之后旧图会留下来冒充新图
+  await fsp.rm(SHOTDIR, { recursive: true, force: true });
+  await fsp.mkdir(SHOTDIR, { recursive: true });
+
   const chrome = findChrome();
   if (!chrome) { console.error('没找到 Chrome/Edge，没法截图。'); process.exit(1); }
 
@@ -179,10 +183,10 @@ async function shot(session, name) {
 
     items = (await request('GET', '/api/items?limit=50')).json.items;
     const plans = [['助眠', '轻语', '直播录屏'], ['美女合集', 'B站', '收藏']];
-    for (let i = 0; i < items.length; i += 1) {
-      const r = await request('POST', `/api/items/${items[i].id}/tags`, { tags: plans[i % plans.length], mode: 'set' });
-      note(`${r.json.item.sizeText.padStart(7)} → ${r.json.item.name}`);
-    }
+
+    // 故意先不打标签，留一张"刚导入、还没分类"的截图：
+    // 这时候文件名保持原样、卡片上带「待分类」角标 —— 这是新加的交互，
+    // 得在文档截图上看得见，所以下面第一次进界面是在"打标签之前"。
 
     // 2) 等缩略图抽好（后台并发 2，两个视频大概一两秒）
     for (const it of items) {
@@ -222,7 +226,36 @@ async function shot(session, name) {
     await until(async () => await evaluate(session, `document.querySelector('#boot').hidden === true`), 25000);
     await until(async () => (await evaluate(session, `document.querySelectorAll('#grid .card').length`)) >= 1, 20000);
     await sleep(1200);   // 等缩略图加载完再截
-    await shot(session, '01-素材列表（按标签浏览，缩略图是真视频抽帧）.png');
+
+    // 01a) 刚导入、一个标签都还没打：文件名保持原样 + 卡片上「待分类」角标
+    const pendingShot = await evaluate(session, `(() => {
+      const cards = [...document.querySelectorAll('#grid .card')];
+      return {
+        names: cards.map((c) => c.querySelector('.name').textContent),
+        badges: [...document.querySelectorAll('#grid .card .badge.pending')].map((b) => b.textContent),
+        origLines: document.querySelectorAll('#grid .card .origname').length,
+      };
+    })()`);
+    note(`未打标签状态：${pendingShot.badges.length} 个「待分类」角标，${pendingShot.origLines} 行重复原名`);
+    if (pendingShot.badges.length !== pendingShot.names.length) {
+      throw new Error(`截图 01a：不是每张卡都带「待分类」角标 → ${JSON.stringify(pendingShot)}`);
+    }
+    await shot(session, '01-刚导入还没分类（保留原文件名 + 待分类角标）.png');
+
+    // 现在打标签（等价于在界面上点标签编辑器保存），然后刷新看改名后的样子
+    for (let i = 0; i < items.length; i += 1) {
+      const r = await request('POST', `/api/items/${items[i].id}/tags`, { tags: plans[i % plans.length], mode: 'set' });
+      note(`${r.json.item.sizeText.padStart(7)} → ${r.json.item.name}`);
+    }
+    await evaluate(session, `location.reload()`);
+    await until(async () => (await evaluate(session, `document.querySelectorAll('#grid .card').length`)) >= 1, 20000);
+    await sleep(1200);
+    const origLines = await evaluate(session, `[...document.querySelectorAll('#grid .card .origname')].map((e) => e.textContent)`);
+    note(`改名后卡片上的原始文件名：${origLines.join(' | ')}`);
+    if (origLines.length < 1) {
+      throw new Error('截图 01：改名后卡片上没有显示「入库时的原始文件名」那一行');
+    }
+    await shot(session, '02-素材列表（按标签浏览，原始文件名可见）.png');
 
     // 点第一个标签，展示"每个标签下都能看到对应视频"
     await evaluate(session, `(async () => {
@@ -231,7 +264,7 @@ async function shot(session, name) {
       target.click();
     })()`);
     await sleep(900);
-    await shot(session, '02-按标签筛选.png');
+    await shot(session, '03-按标签筛选.png');
 
     // 回到全部，打开某个素材的标签编辑器
     await evaluate(session, `document.querySelector('[data-quick="all"]').click()`);
@@ -239,7 +272,15 @@ async function shot(session, name) {
     await evaluate(session, `document.querySelector('#grid .card').click()`);
     await until(async () => await evaluate(session, `document.querySelector('#editor').open === true`), 10000);
     await sleep(1500);
-    await shot(session, '03-标签编辑器（重命名预览）.png');
+    const editorOrig = await evaluate(session, `(() => {
+      const e = document.querySelector('#editorOrig');
+      return { hidden: e.hidden, text: e.textContent.trim() };
+    })()`);
+    note(`编辑器里的原始文件名：${editorOrig.hidden ? '（没显示）' : editorOrig.text}`);
+    if (editorOrig.hidden || !editorOrig.text) {
+      throw new Error('截图 04：标签编辑器里没有显示原始文件名');
+    }
+    await shot(session, '04-标签编辑器（重命名预览 + 原始文件名）.png');
     await evaluate(session, `document.querySelector('#editorCancel').click()`);
     await sleep(500);
 
@@ -255,18 +296,18 @@ async function shot(session, name) {
       const t = await evaluate(session, `document.querySelector('#selCount').textContent`);
       return String(t).replace(/\s/g, '').includes('2');
     }, 10000);
-    if (!picked) throw new Error('截图 04：勾选没有生效（底部选择栏没统计到 2 个）');
+    if (!picked) throw new Error('截图 05：勾选没有生效（底部选择栏没统计到 2 个）');
     const barVisible = await evaluate(session,
       `getComputedStyle(document.querySelector('#selbar')).display !== 'none'`);
-    if (!barVisible) throw new Error('截图 04：底部选择栏不可见');
+    if (!barVisible) throw new Error('截图 05：底部选择栏不可见');
     await sleep(900);
-    await shot(session, '04-多选与批量操作.png');
+    await shot(session, '05-多选与批量操作.png');
 
     // 导出对话框
     await evaluate(session, `document.querySelector('#selExport').click()`);
     await until(async () => await evaluate(session, `document.querySelector('#exportDlg').open === true`), 10000);
     await sleep(700);
-    await shot(session, '05-导出（复制到文件夹，准备数据线拷走）.png');
+    await shot(session, '06-导出（复制到文件夹，准备数据线拷走）.png');
 
     console.log('\n截图完成，开始收尾（把素材恢复原样）…');
   } catch (e) {
@@ -279,7 +320,9 @@ async function shot(session, name) {
     try { proc.kill(); } catch { /* 忽略 */ }
     await sleep(700);
 
-    // ---- 收尾 1：清掉所有标签（等价于在界面上把标签清空），让名字回到 未分类-uuid
+    // ---- 收尾 1：清掉所有标签（等价于在界面上把标签清空）。
+    //      "没打标签就不改名"生效后，清空标签本身就会把名字还原成入库时的相对路径，
+    //      所以这一步现在既是清库、也是恢复名字的主力。
     try {
       const items = (await request('GET', '/api/items?limit=50')).json?.items || [];
       for (const it of items) {
