@@ -557,26 +557,226 @@ function renderSuggestChip() {
   chip.title = '这些素材的文件名长得像「标签1-标签2.扩展名」。点开看要不要认成标签。';
 }
 
+// 弹窗里勾中的素材 id。默认全勾上 —— 大多数情况下这一堆名字确实是以前打的标签，
+// 用户要做的只是"把个别不像的去掉"，所以默认选中比默认不选省事得多。
+const sugChecked = new Set();
+// 用户手动动过勾选的 id：重绘时不再自动勾回来（见 openSuggestions）
+const sugTouched = new Set();
+// 每组"要采纳哪几个标签"的勾选：groupKey -> Set(标签)。默认全勾。
+// 组里的标签是在组头上逐个勾的（"直播录屏"这种不像标签的可以直接取消）。
+const sugTags = new Map();
+// 用户手动动过的标签（groupKey\u0001标签）：重绘时不再自动勾回来
+const sugTagTouched = new Set();
+
+function sugGroupKey(g) { return g.tags.join('\u0001'); }
+
+/** 这一组里勾上的标签（按组头里的顺序） */
+function sugTagsOf(group) {
+  const set = sugTags.get(sugGroupKey(group)) || new Set();
+  return group.tags.filter((t) => set.has(t));
+}
+
+/** 能被采纳的素材：所在组至少还有一个标签勾着。标签全取消的组，整组不参与。 */
+function sugSelectableIds() {
+  const out = [];
+  for (const g of (S.suggest && S.suggest.groups) || []) {
+    if (!sugTagsOf(g).length) continue;
+    for (const id of g.ids) out.push(id);
+  }
+  return out;
+}
+
+/** 把勾选状态同步到界面：数量文字、两个全选框的勾/半勾、采纳按钮可用性 */
+function renderSugSelection() {
+  const ids = sugSelectableIds();
+  const total = ids.length;
+  const picked = ids.filter((id) => sugChecked.has(id)).length;
+
+  const cnt = $('#sugCount');
+  if (cnt) {
+    cnt.textContent = total
+      ? `已勾选 ${picked} / ${total} 个`
+      : '这些标签全被你取消了，没有可采纳的';
+  }
+
+  const all = $('#sugAll');
+  if (all) {
+    all.disabled = total === 0;
+    all.checked = total > 0 && picked === total;
+    all.indeterminate = picked > 0 && picked < total;
+  }
+  for (const box of document.querySelectorAll('#sugList .suggroup')) {
+    const key = box.dataset.group;
+    const g = (S.suggest.groups || []).find((x) => sugGroupKey(x) === key);
+    const gids = g ? g.ids : [];
+    const tagsOn = g ? sugTagsOf(g).length > 0 : true;
+    // 标签全取消的组整体灰掉：这一组点了也不会被改
+    box.classList.toggle('off', !tagsOn);
+    const off = box.querySelector('.sugtagnote');
+    if (off) off.hidden = tagsOn;
+
+    // 逐条的勾选框一律以 sugChecked 为准。点组头的「整组」只改了数据，
+    // 如果不在这里回写，用户看到的会是"点了整组但每条都没勾上"。
+    for (const cb of box.querySelectorAll('.sugpick')) {
+      cb.checked = sugChecked.has(cb.dataset.id);
+      cb.disabled = !tagsOn;
+    }
+    const box2 = box.querySelector('.sugall');
+    if (box2 && gids.length) {
+      const n = gids.filter((id) => sugChecked.has(id)).length;
+      box2.disabled = !tagsOn;
+      box2.checked = tagsOn && n === gids.length;
+      box2.indeterminate = tagsOn && n > 0 && n < gids.length;
+    }
+  }
+
+  const btn = $('#sugAccept');
+  if (btn) {
+    btn.disabled = picked === 0;
+    btn.textContent = picked ? `采纳勾选的 ${picked} 个` : '采纳勾选的（先勾几个）';
+  }
+  const ig = $('#sugIgnoreSel');
+  if (ig) {
+    ig.disabled = picked === 0;
+    ig.textContent = picked ? `勾选的 ${picked} 个别再问` : '勾选的都别再问';
+  }
+  const allBtn = $('#sugIgnore');
+  if (allBtn) allBtn.disabled = ids.length === 0;
+}
+
+let sugPreviewTimer = null;
+
+/** 标签勾选一变，把每条的目标文件名重新算一遍（命名规则在服务端，别在前端重写一份） */
+function scheduleTagPreview() {
+  if (sugPreviewTimer) clearTimeout(sugPreviewTimer);
+  sugPreviewTimer = setTimeout(() => {
+    sugPreviewTimer = null;
+    refreshTagPreviews().catch(() => { /* 预览失败不影响勾选，静默即可 */ });
+  }, 120);
+}
+
+async function refreshTagPreviews() {
+  const pairs = [];
+  for (const g of (S.suggest && S.suggest.groups) || []) {
+    const tags = sugTagsOf(g);
+    if (!tags.length) continue;
+    for (const it of g.items) pairs.push({ id: it.id, tags });
+  }
+  if (!pairs.length) return;
+  const res = await api('/api/suggestions/preview', { method: 'POST', body: { items: pairs } });
+  for (const pv of res.previews || []) {
+    const row = document.querySelector(`#sugList .sugitem[data-id="${pv.id}"]`);
+    if (!row) continue;
+    const nameEl = row.querySelector('.sugnew');
+    if (nameEl) nameEl.textContent = pv.target || '（没选标签）';
+    const dropEl = row.querySelector('.sugdrop');
+    if (dropEl) {
+      const dropped = pv.droppedTags || [];
+      dropEl.hidden = !dropped.length;
+      dropEl.textContent = dropped.length ? `标签太多塞不进文件名，会去掉：${dropped.join('、')}` : '';
+    }
+  }
+}
+
 async function openSuggestions() {
   const data = await refreshSuggestions();
   const list = $('#sugList');
   list.innerHTML = '';
+
+  // 勾选状态跟着 id 走：还在列表里的保留用户的选择，新出现的默认勾上。
+  // 这样「采纳勾选的」之后弹窗重绘，剩下那几条还是原来那个没勾的状态。
+  const live = new Set(data.groups.flatMap((g) => g.ids));
+  for (const id of [...sugChecked]) if (!live.has(id)) sugChecked.delete(id);
+  for (const id of live) if (!sugChecked.has(id) && !sugTouched.has(id)) sugChecked.add(id);
+  for (const id of [...sugTouched]) if (!live.has(id)) sugTouched.delete(id);
+
+  // 标签勾选同样跟着组走：老组保留用户的选择，新出现的标签默认勾上
+  const liveKeys = new Set(data.groups.map((g) => sugGroupKey(g)));
+  for (const key of [...sugTags.keys()]) if (!liveKeys.has(key)) sugTags.delete(key);
+  for (const g of data.groups) {
+    const key = sugGroupKey(g);
+    const prev = sugTags.get(key) || new Set();
+    const next = new Set();
+    for (const t of g.tags) {
+      const tid = `${key}\u0001${t}`;
+      if (sugTagTouched.has(tid)) { if (prev.has(t)) next.add(t); }
+      else next.add(t);
+    }
+    sugTags.set(key, next);
+  }
+  for (const tid of [...sugTagTouched]) {
+    const key = tid.slice(0, tid.indexOf('\u0001'));
+    if (!liveKeys.has(key)) sugTagTouched.delete(tid);
+  }
+
   if (!data.itemCount) {
     list.appendChild(el('div', 'muted', '没有需要确认的了。'));
   } else {
     for (const g of data.groups) {
+      const key = sugGroupKey(g);
       const box = el('div', 'suggroup');
+      box.dataset.group = key;
 
       const head = el('div', 'sughead');
+      // 一组的标签一样，所以这组一起勾最省事；想只采纳其中几个就在标签上逐个勾
+      const gAll = el('label', 'sugallbox');
+      const gAllInput = el('input');
+      gAllInput.type = 'checkbox';
+      gAllInput.className = 'sugall';
+      gAllInput.onchange = () => {
+        for (const id of g.ids) {
+          if (gAllInput.checked) { sugChecked.add(id); sugTouched.delete(id); }
+          else { sugChecked.delete(id); sugTouched.add(id); }
+        }
+        renderSugSelection();
+      };
+      gAll.append(gAllInput, document.createTextNode(' 整组'));
+      head.appendChild(gAll);
+
+      // 认出来的标签本身也是一个个勾选框：不想要的标签直接取消，
+      // 比如 `助眠-直播录屏-轻语.mp3` 里只想要「助眠」和「轻语」。
       const tagWrap = el('div', 'sugtags');
-      for (const t of g.tags) tagWrap.appendChild(el('span', 'tagmini', t));
+      for (const t of g.tags) {
+        const lab = el('label', 'tagpick');
+        const cb = el('input');
+        cb.type = 'checkbox';
+        cb.className = 'sugtag';
+        cb.dataset.tag = t;
+        cb.checked = (sugTags.get(key) || new Set()).has(t);
+        cb.onchange = () => {
+          const set = sugTags.get(key) || new Set();
+          if (cb.checked) { set.add(t); sugTagTouched.delete(`${key}\u0001${t}`); }
+          else { set.delete(t); sugTagTouched.add(`${key}\u0001${t}`); }
+          sugTags.set(key, set);
+          renderSugSelection();
+          scheduleTagPreview();
+        };
+        lab.append(cb, el('span', 'tagpickname', t));
+        tagWrap.appendChild(lab);
+      }
       head.appendChild(tagWrap);
       head.appendChild(el('span', 'muted small', `${g.ids.length} 个素材 · ${humanBytes(g.bytes)}`));
       box.appendChild(head);
 
+      const tagNote = el('div', 'sugtagnote muted small', '这一组的标签都取消了 —— 这一组不会被改动，文件名保持原样。');
+      tagNote.hidden = true;
+      box.appendChild(tagNote);
+
       const items = el('div', 'sugitems');
       for (const it of g.items) {
         const row = el('div', 'sugitem');
+        row.dataset.id = it.id;
+        const cb = el('input');
+        cb.type = 'checkbox';
+        cb.className = 'sugpick';
+        cb.dataset.id = it.id;
+        cb.checked = sugChecked.has(it.id);
+        cb.onchange = () => {
+          if (cb.checked) { sugChecked.add(it.id); sugTouched.delete(it.id); }
+          else { sugChecked.delete(it.id); sugTouched.add(it.id); }
+          renderSugSelection();
+        };
+        row.appendChild(cb);
         row.appendChild(el('span', 'sugkind', it.kindLabel));
         const names = el('div', 'sugnames');
         names.appendChild(el('div', 'sugold', it.origName || it.name));
@@ -585,28 +785,22 @@ async function openSuggestions() {
         const line = el('div', 'sugnewline');
         line.append(arrow, newName);
         names.appendChild(line);
+        const drop = el('div', 'sugdrop muted small');
+        drop.hidden = true;
+        names.appendChild(drop);
         row.appendChild(names);
         items.appendChild(row);
       }
       if (g.ids.length > g.items.length) {
-        items.appendChild(el('div', 'muted small', `…另外还有 ${g.ids.length - g.items.length} 个同类素材`));
+        items.appendChild(el('div', 'muted small', `…另外还有 ${g.ids.length - g.items.length} 个同类素材（一起勾/一起不勾）`));
       }
       box.appendChild(items);
-
-      const acts = el('div', 'sugacts');
-      const yes = el('button', 'btn primary tiny', `采纳这 ${g.ids.length} 个`);
-      yes.type = 'button';
-      yes.onclick = () => acceptSuggestion(g, 'group');
-      const no = el('button', 'btn ghost tiny', '这组不用');
-      no.type = 'button';
-      no.onclick = () => ignoreSuggestion(g, 'group');
-      acts.append(yes, no);
-      box.appendChild(acts);
-
       list.appendChild(box);
     }
   }
+
   if (!$('#suggestDlg').open) $('#suggestDlg').showModal();
+  renderSugSelection();
 }
 
 function describeAcceptResult(res) {
@@ -618,10 +812,21 @@ function describeAcceptResult(res) {
   return parts.join('，');
 }
 
-async function acceptSuggestion(group, mode) {
-  const body = mode === 'all' ? {} : { ids: group.ids, tags: group.tags };
+/** 采纳：只处理勾中的那些素材，每条只采纳它那一组里还勾着的标签。 */
+async function acceptSuggestion() {
+  const selectable = new Set(sugSelectableIds());
+  const items = [];
+  for (const g of (S.suggest && S.suggest.groups) || []) {
+    const tags = sugTagsOf(g);
+    if (!tags.length) continue;
+    for (const id of g.ids) {
+      if (!selectable.has(id) || !sugChecked.has(id)) continue;
+      items.push({ id, tags });
+    }
+  }
+  if (!items.length) { toast('先勾几个要采纳的', 'err'); return; }
   try {
-    const res = await api('/api/suggestions/accept', { method: 'POST', body });
+    const res = await api('/api/suggestions/accept', { method: 'POST', body: { items } });
     toast(describeAcceptResult(res), res.failures && res.failures.length ? 'err' : 'ok');
     await afterMutation();
     if (!S.suggest.itemCount) $('#suggestDlg').close();
@@ -629,9 +834,10 @@ async function acceptSuggestion(group, mode) {
   } catch (err) { toast(err.message, 'err'); }
 }
 
-async function ignoreSuggestion(group, mode) {
-  const body = mode === 'all' ? {} : { ids: group.ids };
+/** 忽略：不带 ids = 全部。"别再问"按钮只处理勾中的那些。 */
+async function ignoreSuggestion(ids) {
   try {
+    const body = Array.isArray(ids) && ids.length ? { ids } : {};
     await api('/api/suggestions/ignore', { method: 'POST', body });
     await afterMutation();
     if (!S.suggest.itemCount) {
@@ -1032,8 +1238,20 @@ function applyPicked(target, p) {
 function bindEvents() {
   $('#suggestChip').onclick = () => openSuggestions();
   $('#sugClose').onclick = () => $('#suggestDlg').close();
-  $('#sugAccept').onclick = () => acceptSuggestion(null, 'all');
-  $('#sugIgnore').onclick = () => ignoreSuggestion(null, 'all');
+  $('#sugAccept').onclick = () => acceptSuggestion();
+  $('#sugIgnore').onclick = () => ignoreSuggestion(null);
+  $('#sugIgnoreSel').onclick = () => ignoreSuggestion(sugSelectableIds().filter((id) => sugChecked.has(id)));
+  $('#sugAll').onchange = (ev) => {
+    const ids = sugSelectableIds();
+    sugChecked.clear();
+    if (ev.target.checked) {
+      sugTouched.clear();
+      for (const id of ids) sugChecked.add(id);
+    } else {
+      for (const id of ids) sugTouched.add(id);
+    }
+    renderSugSelection();
+  };
   // 启动
   $('#bootGo').onclick = bootFromInput;
   $('#bootPath').onkeydown = (ev) => { if (ev.key === 'Enter') bootFromInput(); };

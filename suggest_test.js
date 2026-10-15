@@ -2,7 +2,7 @@
  * suggest_test.js —— 「从文件名里认出旧标签」这个功能的浏览器端验证。
  *
  * 为什么要有这一套：这个功能的一半在服务端（识别、计数、采纳时改名），
- * 另一半在浏览器里（弹窗、逐组采纳/不用、卡片上的提示条）。服务端对了但弹窗不出来，
+ * 另一半在浏览器里（弹窗、勾选框挑选、卡片上的提示条）。服务端对了但弹窗不出来，
  * 功能等于没做。所以这里起真服务 + 真 Chrome，用 CDP 点真实按钮。
  *
  * 场景：一个文件夹里混着
@@ -307,7 +307,7 @@ async function main() {
       chipHidden: document.querySelector('#suggestChip').hidden,
       groups: document.querySelectorAll('#sugList .suggroup').length,
       firstTags: [...document.querySelectorAll('#sugList .suggroup')][0]
-        ? [...[...document.querySelectorAll('#sugList .suggroup')][0].querySelectorAll('.sugtags .tagmini')].map(n => n.textContent) : [],
+        ? [...[...document.querySelectorAll('#sugList .suggroup')][0].querySelectorAll('.sugtags .tagpickname')].map(n => n.textContent) : [],
       hasArrow: document.querySelectorAll('#sugList .sugnew').length > 0,
       newNameShown: [...document.querySelectorAll('#sugList .sugnew')].map(n => n.textContent).slice(0, 3),
       oldNameShown: [...document.querySelectorAll('#sugList .sugold')].map(n => n.textContent).slice(0, 3),
@@ -322,61 +322,189 @@ async function main() {
     check('预览里的新名带 uuid', ui.newNameShown.some((n) => /[0-9a-f]{32}\./.test(n)), JSON.stringify(ui.newNameShown));
     await shot(session, '01-自动识别弹窗.png');
 
-    // ---------------------------------------------------------- 3. 逐组采纳 / 不用
-    section('3. 采纳一组、另一组点「不用」，看磁盘和标签');
+    // ---------------------------------------------------------- 3. 用勾选框挑着采纳
+    section('3. 勾选框：清掉全选、只勾一组采纳，另一组勾上「别再问」');
 
-    // 找到「助眠-直播录屏-轻语」那一组对应的按钮（页面上按钮文字是「采纳这 N 个」）
-    const clicked = await evaluate(session, `(() => {
-      const groups = [...document.querySelectorAll('#sugList .suggroup')];
-      const g = groups.find((n) => [...n.querySelectorAll('.sugtags .tagmini')].map(t => t.textContent).includes('轻语'));
-      if (!g) return null;
-      const btn = [...g.querySelectorAll('button')].find((b) => b.textContent.startsWith('采纳'));
-      btn.click();
-      return btn.textContent;
+    // 弹窗默认全勾上（省得用户一个个点）。先验证「默认全勾」，再全部取消，从零开始挑。
+    const defaults = await evaluate(session, `(() => {
+      const boxes = [...document.querySelectorAll('#sugList .sugpick')];
+      return JSON.stringify({
+        boxes: boxes.length,
+        checked: boxes.filter((b) => b.checked).length,
+        count: document.querySelector('#sugCount').textContent,
+        allChecked: document.querySelector('#sugAll').checked,
+        btn: document.querySelector('#sugAccept').textContent,
+      });
     })()`);
-    check('在弹窗里点了「助眠-直播录屏-轻语」那组的采纳按钮', Boolean(clicked), '没找到按钮');
+    const def = JSON.parse(defaults);
+    check('弹窗里每条素材都有一个勾选框，且默认全勾上', def.boxes > 0 && def.checked === def.boxes, defaults);
+    check('顶部「全选」跟着是勾上的，数量文字也对得上',
+      def.allChecked === true && def.count.includes(`已勾选 ${def.boxes} / ${def.boxes}`), defaults);
+    note(`默认勾选：${def.count}；按钮：${def.btn}`);
+
+    const cleared = await evaluate(session, `(() => {
+      const all = document.querySelector('#sugAll');
+      if (all.checked) all.click();
+      const boxes = [...document.querySelectorAll('#sugList .sugpick')];
+      return JSON.stringify({
+        left: boxes.filter((b) => b.checked).length,
+        count: document.querySelector('#sugCount').textContent,
+        disabled: document.querySelector('#sugAccept').disabled,
+        btn: document.querySelector('#sugAccept').textContent,
+      });
+    })()`);
+    const cl = JSON.parse(cleared);
+    check('取消「全选」之后一个都不剩', cl.left === 0, cleared);
+    check('一个都没勾时「采纳」按钮被禁用，并提示先勾几个',
+      cl.disabled === true && cl.btn.includes('先勾'), cleared);
+    note(`取消全选后：${cl.count}；按钮：${cl.btn}（disabled=${cl.disabled}）`);
+
+    // 用组头的「整组」勾上「助眠-直播录屏-轻语」那组（组里好几条时不用一个个点）
+    const pickedOne = await evaluate(session, `(() => {
+      const groups = [...document.querySelectorAll('#sugList .suggroup')];
+      const g = groups.find((n) => [...n.querySelectorAll('.sugtags .tagpickname')].map(t => t.textContent).includes('轻语'));
+      if (!g) return null;
+      g.querySelector('.sugall').click();
+      const boxes = [...g.querySelectorAll('.sugpick')];
+      return JSON.stringify({
+        boxes: boxes.length,
+        checked: boxes.filter((b) => b.checked).length,
+        count: document.querySelector('#sugCount').textContent,
+        btn: document.querySelector('#sugAccept').textContent,
+        disabled: document.querySelector('#sugAccept').disabled,
+      });
+    })()`);
+    check('点组头的「整组」能把这一组全勾上', Boolean(pickedOne), '没找到「助眠-直播录屏-轻语」那一组');
+    const p1 = JSON.parse(pickedOne || '{}');
+    check('勾上的条数等于这一组的素材数，每条也跟着勾上、按钮文字跟着变',
+      p1.checked === p1.boxes && p1.checked > 0 && p1.btn.includes(String(p1.checked)) && p1.disabled === false, pickedOne);
+    note(`勾了一组：${p1.count}；按钮：${p1.btn}`);
+
+    // ---- 3b. 认出来的标签本身也是勾选框：取消「直播录屏」，只留「助眠」「轻语」
+    const tagBoxes = await evaluate(session, `(() => {
+      const boxes = [...document.querySelectorAll('#sugList .sugtags .tagpick input')];
+      return JSON.stringify({ n: boxes.length, checked: boxes.filter((b) => b.checked).length });
+    })()`);
+    const tb = JSON.parse(tagBoxes);
+    check('认出来的每个标签都是一个勾选框，默认全勾上', tb.n > 0 && tb.checked === tb.n, tagBoxes);
+
+    const tagOff = await evaluate(session, `(() => {
+      const groups = [...document.querySelectorAll('#sugList .suggroup')];
+      const g = groups.find((n) => [...n.querySelectorAll('.sugtags .tagpickname')].map(t => t.textContent).includes('轻语'));
+      if (!g) return null;
+      const pick = [...g.querySelectorAll('.sugtags .tagpick input')]
+        .find((b) => b.closest('.tagpick').textContent.trim() === '直播录屏');
+      if (!pick) return null;
+      pick.click();
+      return JSON.stringify({
+        tagsOn: [...g.querySelectorAll('.sugtags .tagpick input')]
+          .filter((b) => b.checked).map((b) => b.closest('.tagpick').textContent.trim()),
+        itemChecked: [...g.querySelectorAll('.sugpick')].filter((b) => b.checked).length,
+        count: document.querySelector('#sugCount').textContent,
+      });
+    })()`);
+    check('能在组里单独取消一个标签（取消「直播录屏」）', Boolean(tagOff), '没找到「助眠-直播录屏-轻语」那组的标签勾选框');
+    const to = JSON.parse(tagOff || '{}');
+    check('取消之后这组只剩「助眠」「轻语」两个标签勾着', (to.tagsOn || []).join(',') === '助眠,轻语', tagOff);
+    check('取消一个标签不影响这一组里素材本身的勾选', to.itemChecked === 1, tagOff);
+    note(`这一组勾着的标签：${(to.tagsOn || []).join('、')}；${to.count}`);
+
+    // 预览名要跟着标签勾选实时变（命名规则在服务端算，前端得去问）
+    const previewLive = await until(async () => {
+      const txt = await evaluate(session, `(() => {
+        const groups = [...document.querySelectorAll('#sugList .suggroup')];
+        const g = groups.find((n) => [...n.querySelectorAll('.sugtags .tagpickname')].map(t => t.textContent).includes('轻语'));
+        const row = g ? g.querySelector('.sugitem .sugnew') : null;
+        return row ? row.textContent : '';
+      })()`);
+      return /^助眠-轻语-[0-9a-f]{32}\.mp3$/.test(txt);
+    }, 12000);
+    check('取消一个标签后，预览的新文件名立刻跟着去掉那一段', previewLive === true,
+      await evaluate(session, `document.querySelector('#sugList .sugitem .sugnew').textContent`));
+
+    // ---- 3c. 一组的标签全取消 → 整组不参与、明细勾选框禁用
+    const allOff = await evaluate(session, `(() => {
+      const groups = [...document.querySelectorAll('#sugList .suggroup')];
+      const g = groups.find((n) => [...n.querySelectorAll('.sugtags .tagpickname')].map(t => t.textContent).includes('2024'));
+      if (!g) return null;
+      for (const b of [...g.querySelectorAll('.sugtags .tagpick input')]) if (b.checked) b.click();
+      return JSON.stringify({
+        off: g.classList.contains('off'),
+        disabled: [...g.querySelectorAll('.sugpick')].every((b) => b.disabled),
+        noteShown: !g.querySelector('.sugtagnote').hidden,
+      });
+    })()`);
+    check('一组的标签全取消后，整组灰掉', Boolean(allOff) && JSON.parse(allOff).off === true, allOff);
+    check('整组灰掉时明细勾选框被禁用、并给出说明',
+      Boolean(allOff) && JSON.parse(allOff).disabled === true && JSON.parse(allOff).noteShown === true, allOff);
+
+    const restored = await evaluate(session, `(() => {
+      const groups = [...document.querySelectorAll('#sugList .suggroup')];
+      const g = groups.find((n) => [...n.querySelectorAll('.sugtags .tagpickname')].map(t => t.textContent).includes('2024'));
+      for (const b of [...g.querySelectorAll('.sugtags .tagpick input')]) if (!b.checked) b.click();
+      return JSON.stringify({ off: g.classList.contains('off'), count: document.querySelector('#sugCount').textContent });
+    })()`);
+    check('把标签重新勾上，整组又活了', JSON.parse(restored).off === false, restored);
+    note(`重新勾上后：${JSON.parse(restored).count}`);
+
+    const clicked = await evaluate(session, `(() => {
+      const btn = document.querySelector('#sugAccept');
+      const text = btn.textContent;
+      btn.click();
+      return text;
+    })()`);
     note(`点了：${clicked}`);
 
     const accepted = await until(async () => {
       const d = await disk();
-      return d.some((n) => /^助眠-直播录屏-轻语-[0-9a-f]{32}\.mp3$/.test(n));
+      return d.some((n) => /^助眠-轻语-[0-9a-f]{32}\.mp3$/.test(n));
     }, 25000);
-    check('采纳后磁盘上出现规范的「标签-uuid.扩展名」', accepted === true, JSON.stringify(await disk()));
+    check('采纳时只用了勾着的标签（磁盘上是「助眠-轻语-uuid.mp3」，没有「直播录屏」）', accepted === true,
+      JSON.stringify(await disk()));
+    check('没勾的那些没被顺手改掉（旅行-风景.mp4 还在）', (await disk()).includes('旅行-风景.mp4'),
+      JSON.stringify(await disk()));
 
-    // 再点一组「不用」
+    // 再勾上「旅行-风景」那组，点「勾选的别再问」——文件不该动，且这组不该再冒出来
     const ignored = await evaluate(session, `(() => {
       const groups = [...document.querySelectorAll('#sugList .suggroup')];
-      const g = groups.find((n) => [...n.querySelectorAll('.sugtags .tagmini')].map(t => t.textContent).join('-') === '旅行-风景');
+      const g = groups.find((n) => [...n.querySelectorAll('.sugtags .tagpickname')].map(t => t.textContent).join('-') === '旅行-风景');
       if (!g) return null;
-      const btn = [...g.querySelectorAll('button')].find((b) => b.textContent.includes('不用'));
+      g.querySelector('.sugall').click();
+      const btn = document.querySelector('#sugIgnoreSel');
+      const text = btn.textContent;
       btn.click();
-      return btn.textContent;
+      return text;
     })()`);
-    check('在弹窗里点了「旅行-风景」那组的「不用」', Boolean(ignored), '没找到按钮');
+    check('在弹窗里点了「勾选的别再问」', Boolean(ignored), '没找到「旅行-风景」那一组');
     note(`点了：${ignored}`);
 
     const stillThere = await until(async () => (await disk()).includes('旅行-风景.mp4'), 20000);
-    check('点「不用」之后磁盘文件没被动过', stillThere === true, JSON.stringify(await disk()));
+    check('点「别再问」之后磁盘文件没被动过', stillThere === true, JSON.stringify(await disk()));
 
-    const afterIgnore = await apiget('/api/suggestions');
-    const keysLeft = afterIgnore.groups.map((g) => g.tags.join('-'));
-    check('点过「不用」的那组不再出现在弹窗里', !keysLeft.includes('旅行-风景'), JSON.stringify(keysLeft));
-    note(`剩余待确认：${keysLeft.join(' / ') || '(无)'}`);
+    const noGroup = await until(async () => {
+      const keys = (await apiget('/api/suggestions')).groups.map((g) => g.tags.join('-'));
+      return !keys.includes('旅行-风景');
+    }, 20000);
+    check('点过「别再问」的那组不再出现在接口里', noGroup === true, JSON.stringify((await apiget('/api/suggestions')).groups.map((g) => g.tags)));
+    const uiGroups = await evaluate(session, `JSON.stringify([...document.querySelectorAll('#sugList .suggroup')].map((g) => [...g.querySelectorAll('.sugtags .tagpickname')].map(t => t.textContent).join('-')))`);
+    check('弹窗里那一组也消失了（不用重新打开弹窗）', !JSON.parse(uiGroups).includes('旅行-风景'), uiGroups);
+    note(`剩余待确认：${JSON.parse(uiGroups).join(' / ') || '(无)'}`);
 
     const taggedItem = (await apiget('/api/items')).items.find((i) => /^助眠/.test(i.name));
-    check('采纳后的素材标签真的进了库', Boolean(taggedItem) && taggedItem.tags.join(',') === '助眠,直播录屏,轻语',
+    check('采纳后的素材，库里记的标签就是勾着的那两个', Boolean(taggedItem) && taggedItem.tags.join(',') === '助眠,轻语',
       taggedItem ? JSON.stringify(taggedItem.tags) : '找不到');
     check('采纳后的素材不再是「待分类」', Boolean(taggedItem) && taggedItem.tagSuggest === null,
       taggedItem ? JSON.stringify(taggedItem.tagSuggest) : '');
 
-    // ---------------------------------------------------------- 4. 全部采纳
-    section('4. 点「全部采纳」把剩下的都认下来');
+    // ---------------------------------------------------------- 4. 全选之后一次采纳
+    section('4. 点「全选」再「采纳勾选的」，把剩下的都认下来');
+    await evaluate(session, `document.querySelector('#sugAll').click()`);
     await evaluate(session, `document.querySelector('#sugAccept').click()`);
     const allDone = await until(async () => {
       const s = await apiget('/api/suggestions');
       return s.itemCount === 0;
     }, 25000);
-    check('「全部采纳」之后没有待确认的了', allDone === true,
+    check('全选采纳之后没有待确认的了', allDone === true,
       JSON.stringify((await apiget('/api/suggestions')).groups.map((g) => g.tags)));
 
     const d2 = await disk();
@@ -384,13 +512,13 @@ async function main() {
     // 判断「改没改成规范名」不能只看开头一段：标签本身也可能带多个连字符
     // （比如 "08-2024-23 直播录屏-<uuid>.mp4"），所以直接找文件名里有没有那个 uuid。
     const isNormalized = (n) => /[0-9a-f]{32}/.test(n);
-    // 这两个本来就该保持原名：一个被用户点过「不用」，一个压根没被认出来（没有连字符）
+    // 这两个本来就该保持原名：一个被用户勾上「别再问」过，一个压根没被认出来（没有连字符）
     const keepOriginal = ['旅行-风景.mp4', '单段.mp4'];
     const notNormalized = d2.filter((n) => !isNormalized(n) && !keepOriginal.includes(n));
     check('该被认成标签的都改成了规范名，不该动的两个保持原名', notNormalized.length === 0, JSON.stringify(notNormalized));
-    check('用户点过「不用」的文件名字没被动过', d2.includes('旅行-风景.mp4'), JSON.stringify(d2));
+    check('用户勾过「别再问」的文件名字没被动过', d2.includes('旅行-风景.mp4'), JSON.stringify(d2));
     check('没被认出来的文件名字没被动过', d2.includes('单段.mp4'), JSON.stringify(d2));
-    // 弹窗可能比接口晚一步合上（点「全部采纳」之后要等 afterMutation 走完），
+    // 弹窗可能比接口晚一步合上（点「采纳勾选的」之后要等 afterMutation 走完），
     // 所以这里等一下再断言，不然会偶发地看到还没合的框（曾经就这样抖过一次）。
     const dlgClosed = await until(async () => {
       const open = await evaluate(session, `document.querySelector('#suggestDlg').open`);
@@ -402,8 +530,8 @@ async function main() {
     const stats = await apiget('/api/state');
     note(`重扫后统计：${stats.stats.total} 个素材 / ${stats.stats.tagged} 已打标签 / ${stats.stats.tags} 个标签`);
 
-    // 「不用」的决定要能跨重启记住
-    section('5. 重启服务：「不用」的决定还记得，且不会再弹');
+    // 「别再问」的决定要能跨重启记住
+    section('5. 重启服务：「别再问」的决定还记得，且不会再弹');
     app.kill();
     await sleep(600);
     const appLogFd2 = fs.openSync(appLog, 'a');
@@ -413,9 +541,9 @@ async function main() {
       const up2 = await until(async () => (await fetch(`${BASE}/api/state`)).ok, 20000, 250);
       check('重启后服务又起来了', up2 === true);
       const s2 = await apiget('/api/suggestions');
-      check('重启后不再提示那组被「不用」过的文件名', !s2.groups.map((g) => g.tags.join('-')).includes('旅行-风景'),
+      check('重启后不再提示那组被「别再问」过的文件名', !s2.groups.map((g) => g.tags.join('-')).includes('旅行-风景'),
         JSON.stringify(s2.groups.map((g) => g.tags)));
-      check('重启后文件名依然保持规范名 / 「不用」的原样', (await disk()).includes('旅行-风景.mp4'), JSON.stringify(await disk()));
+      check('重启后文件名依然保持规范名 / 「别再问」的原样', (await disk()).includes('旅行-风景.mp4'), JSON.stringify(await disk()));
 
       // 用户自己把这个文件改名了 → 旧决定失效，应该重新提示
       const item = (await apiget('/api/items')).items.find((i) => i.name === '旅行-风景.mp4');

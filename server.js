@@ -500,14 +500,35 @@ route('GET', /^\/api\/suggestions$/, async () => {
   return state.library.suggestions();
 });
 
+// 弹窗里用户改了"要采纳哪几个标签"的勾选 → 重新算一遍每条的目标文件名。
+// 命名预算/超长裁剪都在服务端，前端只负责把勾了哪些标签传上来。
+route('POST', /^\/api\/suggestions\/preview$/, async (req) => {
+  requireLibrary();
+  const body = await readBody(req);
+  const pairs = Array.isArray(body.items)
+    ? body.items.map((x) => ({ id: String((x && x.id) || ''), tags: Array.isArray(x && x.tags) ? x.tags : [] }))
+    : [];
+  return state.library.previewSuggestions(pairs);
+});
+
 route('POST', /^\/api\/suggestions\/accept$/, async (req) => {
   requireLibrary();
   const body = await readBody(req);
   let ids = Array.isArray(body.ids) ? body.ids.map(String) : [];
+  // 逐条的标签选择：{ items: [{ id, tags: [...] }] }
+  const tagMap = {};
+  if (Array.isArray(body.items)) {
+    for (const x of body.items) {
+      if (!x || !x.id) continue;
+      const id = String(x.id);
+      tagMap[id] = Array.isArray(x.tags) ? x.tags.map(String) : [];
+      if (!ids.includes(id)) ids.push(id);
+    }
+  }
   if (!ids.length) ids = state.library.suggestions().groups.flatMap((g) => g.ids);
   if (!ids.length) return { ok: true, accepted: 0, skipped: 0, failures: [], remaining: 0, stats: state.db.stats(), tags: state.db.tagList() };
   const tags = Array.isArray(body.tags) ? body.tags : (body.tags ? tagsMod.splitTagInput(body.tags) : null);
-  const res = await state.library.acceptSuggestions(ids, { tags });
+  const res = await state.library.acceptSuggestions(ids, { tags, tagMap });
   return { ...res, stats: state.db.stats(), tags: state.db.tagList() };
 });
 

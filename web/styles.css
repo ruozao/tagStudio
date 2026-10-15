@@ -261,7 +261,9 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .sughead { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
 .sugtags { display: flex; gap: 6px; flex-wrap: wrap; }
 .sugitems { display: flex; flex-direction: column; gap: 6px; max-height: 190px; overflow: auto; }
-.sugitem { display: grid; grid-template-columns: 44px 1fr; gap: 8px; align-items: start; font-size: 12px; }
+/* 第一列是勾选框，第二列是类型，第三列是文件名/新文件名 */
+.sugitem { display: grid; grid-template-columns: auto 44px 1fr; gap: 8px; align-items: start; font-size: 12px; }
+.sugitem input[type="checkbox"] { margin: 2px 0 0; }
 .sugkind { color: var(--fg3); font-size: 11px; padding-top: 2px; }
 .sugnames { min-width: 0; }
 .sugold { color: var(--fg2); word-break: break-all; }
@@ -269,6 +271,24 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .sugarrow { color: var(--fg3); }
 .sugnew { color: #9fe0a8; word-break: break-all; }
 .sugacts { display: flex; gap: 8px; margin-top: 10px; }
+/* 顶部那条「全选 + 已勾选 N / M」 */
+.sugbar { display: flex; align-items: center; gap: 12px; margin: 2px 0 10px; }
+.check-all { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.sugallbox { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--fg3); cursor: pointer; }
+/* 认出来的标签本身是勾选框：外形还是标签 chip，前面多一个小勾 */
+.sugtags { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.tagpick {
+  display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  font-size: 11px; background: #0e1116; border: 1px solid var(--line);
+  border-radius: 999px; padding: 1px 8px 1px 6px; color: #b9c6da;
+}
+.tagpick input { margin: 0; width: 12px; height: 12px; }
+.tagpick:has(input:not(:checked)) { color: var(--fg3); border-style: dashed; opacity: .75; }
+.tagpickname { line-height: 1.6; }
+/* 一组的标签全取消 → 整组灰掉，明确告诉用户"这一组不会被动" */
+.suggroup.off { opacity: .55; }
+.sugtagnote { margin: -2px 0 8px; color: var(--warn); }
+.sugdrop { color: var(--warn); }
 
 .empty { text-align: center; color: var(--fg3); padding: 60px 20px; }
 .empty h3 { color: var(--fg2); margin: 0 0 8px; }

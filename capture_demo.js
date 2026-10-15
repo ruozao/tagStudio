@@ -253,11 +253,57 @@ async function shot(session, name) {
     await sleep(900);
     const sugInfo = await evaluate(session, `(() => ({
       groups: document.querySelectorAll('#suggestDlg #sugList .suggroup').length,
-      tags: [...document.querySelectorAll('#suggestDlg #sugList .tagmini')].map((e) => e.textContent),
+      tags: [...document.querySelectorAll('#suggestDlg #sugList .tagpickname')].map((e) => e.textContent),
+      boxes: document.querySelectorAll('#suggestDlg #sugList .sugpick').length,
+      hasAll: Boolean(document.querySelector('#suggestDlg #sugAll')),
     }))()`);
     note(`确认弹窗里的标签组合：${sugInfo.tags.join(' / ')}（${sugInfo.groups} 组）`);
     if (sugInfo.groups < 2) throw new Error(`截图 01b：弹窗没有列出两组候选 → ${JSON.stringify(sugInfo)}`);
-    await shot(session, '01b-文件名里认出旧标签（弹窗让用户选）.png');
+    if (!sugInfo.hasAll || sugInfo.boxes < 2) throw new Error(`截图 01b：弹窗里没有逐条的勾选框 → ${JSON.stringify(sugInfo)}`);
+
+    // 截图要能说明「用户可以自己挑」：取消最不像标签的那一组，留下 2/3 勾选的样子
+    const pickState = await evaluate(session, `(() => {
+      const first = document.querySelector('#suggestDlg #sugList .suggroup .sugall');
+      if (first && first.checked) first.click();
+      return JSON.stringify({
+        count: document.querySelector('#sugCount').textContent,
+        btn: document.querySelector('#sugAccept').textContent,
+        checked: [...document.querySelectorAll('#suggestDlg #sugList .sugpick')].filter((b) => b.checked).length,
+      });
+    })()`);
+    const ps = JSON.parse(pickState);
+    note(`勾选状态：${ps.count}；按钮：${ps.btn}`);
+    if (ps.checked === 0) throw new Error(`截图 01b：取消一组之后勾选数不应该为 0 → ${pickState}`);
+
+    // 还要展示「认出来的标签本身也能逐个挑」：把最不像标签的那个（直播录屏）取消勾选，
+    // 预览的新文件名应该立刻少掉那一段。
+    const tagPick = await evaluate(session, `(() => {
+      const groups = [...document.querySelectorAll('#suggestDlg #sugList .suggroup')];
+      const g = groups.find((n) => [...n.querySelectorAll('.tagpickname')].map((t) => t.textContent).includes('轻语'));
+      if (!g) return null;
+      const box = [...g.querySelectorAll('.sugtags .tagpick input')]
+        .find((b) => b.closest('.tagpick').textContent.trim() === '直播录屏');
+      if (!box) return null;
+      box.click();
+      return 'ok';
+    })()`);
+    if (tagPick !== 'ok') throw new Error('截图 01b：没找到「直播录屏」这个标签勾选框');
+    await sleep(900); // 等预览名（服务端算的）刷回来
+    const afterTag = await evaluate(session, `(() => {
+      const groups = [...document.querySelectorAll('#suggestDlg #sugList .suggroup')];
+      const g = groups.find((n) => [...n.querySelectorAll('.tagpickname')].map((t) => t.textContent).includes('轻语'));
+      return JSON.stringify({
+        tags: [...g.querySelectorAll('.sugtags .tagpick input')].filter((b) => b.checked)
+          .map((b) => b.closest('.tagpick').textContent.trim()),
+        preview: g.querySelector('.sugitem .sugnew').textContent,
+      });
+    })()`);
+    const at = JSON.parse(afterTag);
+    note(`取消「直播录屏」后：这一组勾着 ${at.tags.join('、')}；预览名 ${at.preview}`);
+    if (at.preview.includes('直播录屏')) {
+      throw new Error(`截图 01b：取消标签后预览名还带着它 → ${afterTag}`);
+    }
+    await shot(session, '01b-文件名里认出旧标签（弹窗里自己勾选）.png');
 
     // 收拾这两个演员：删掉文件 + 删库，回到"只有两个真视频、刚入库"的状态
     for (const n of castNames) await fsp.rm(path.join(LIB, n), { force: true });
