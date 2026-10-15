@@ -540,6 +540,10 @@ async function refreshSuggestions() {
     S.suggest = { count: 0, itemCount: 0, groups: [] };
   }
   renderSuggestChip();
+  // 弹窗开着但已经没事可确认了（比如后台轮询把最后一组也处理掉了、或者用户在别处清空了标签）：
+  // 自己合上，别留一个空框在那儿。
+  const dlg = $('#suggestDlg');
+  if (dlg && dlg.open && !(S.suggest && S.suggest.itemCount)) dlg.close();
   return S.suggest;
 }
 

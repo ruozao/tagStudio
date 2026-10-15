@@ -390,7 +390,13 @@ async function main() {
     check('该被认成标签的都改成了规范名，不该动的两个保持原名', notNormalized.length === 0, JSON.stringify(notNormalized));
     check('用户点过「不用」的文件名字没被动过', d2.includes('旅行-风景.mp4'), JSON.stringify(d2));
     check('没被认出来的文件名字没被动过', d2.includes('单段.mp4'), JSON.stringify(d2));
-    check('弹窗已关闭', (await evaluate(session, `document.querySelector('#suggestDlg').open`)) === false,
+    // 弹窗可能比接口晚一步合上（点「全部采纳」之后要等 afterMutation 走完），
+    // 所以这里等一下再断言，不然会偶发地看到还没合的框（曾经就这样抖过一次）。
+    const dlgClosed = await until(async () => {
+      const open = await evaluate(session, `document.querySelector('#suggestDlg').open`);
+      return open === false;
+    }, 8000);
+    check('弹窗已关闭', dlgClosed === true,
       await evaluate(session, `JSON.stringify({ open: document.querySelector('#suggestDlg').open, chip: document.querySelector('#suggestChip').textContent, chipHidden: document.querySelector('#suggestChip').hidden, groups: document.querySelectorAll('#sugList .suggroup').length })`));
 
     const stats = await apiget('/api/state');
