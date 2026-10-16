@@ -135,10 +135,12 @@ async function testNaming() {
 
   const id = util.hex32();
   const b1 = naming.buildName({ id, originalName: '原视频.MP4', tags: ['美食', '助眠'] });
-  eq('两个标签 → 按码点排序后用 - 连接', b1.name, `助眠-美食-${id}.MP4`);
+  eq('两个标签按输入顺序用 - 连接（第一个是主要特点，不按码点重排）', b1.name, `美食-助眠-${id}.MP4`);
   check('扩展名大小写原样保留', b1.name.endsWith('.MP4'), b1.name);
   eq('34 位 uuid 完整保留', naming.parseIdFromName(b1.name), id);
-  eq('反解标签一致', JSON.stringify(naming.parseTagsFromName(b1.name)), JSON.stringify(['助眠', '美食']));
+  eq('反解标签一致（顺序也保留）', JSON.stringify(naming.parseTagsFromName(b1.name)), JSON.stringify(['美食', '助眠']));
+  const b1b = naming.buildName({ id, originalName: '原视频.MP4', tags: ['助眠', '美食'] });
+  eq('调换顺序会得到另一个文件名', b1b.name, `助眠-美食-${id}.MP4`);
 
   const b2 = naming.buildName({ id, originalName: '2024-08-23 直播录屏.mp3', tags: [] });
   eq('没有标签 → 保持原文件名不动（用户要靠原名判断该打什么标签）', b2.name, '2024-08-23 直播录屏.mp3');
@@ -153,13 +155,13 @@ async function testNaming() {
   const b2d = naming.buildName({ id, originalName: '旧手机导出的照片.jpg', tags: [] });
   eq('清空标签后回到原名', b2d.name, '旧手机导出的照片.jpg');
 
-  const b3 = naming.buildName({ id, originalName: 'x.webm', tags: ['A', 'b', 'C'] });
-  eq('标签排序大小写不敏感（A → b → C）', b3.name, `A-b-C-${id}.webm`);
+  const b3 = naming.buildName({ id, originalName: 'x.webm', tags: ['b', 'A', 'C', 'a'] });
+  eq('大小写不同的同一个标签只留第一次，其余顺序不动', b3.name, `b-A-C-${id}.webm`);
   check('文件名不超过 180 字节预算', util.bbytes(b3.name) <= naming.DEFAULT_BUDGET_BYTES, `${util.bbytes(b3.name)} 字节`);
 
   const many = ['一个中文标签', '第二个中文标签', '第三个中文标签', '第四个中文标签', '第五个', '第六个', '第七个', '第八个', '第九个', '第十个'];
   const b4 = naming.buildName({ id, originalName: 'video.mp4', tags: many });
-  check('塞不下的标签从头丢弃', b4.droppedTags.length > 0, `丢了 ${b4.droppedTags.length} 个`);
+  check('放不下时从末尾丢次要标签', b4.droppedTags.includes('第十个') && b4.name.startsWith('一个中文标签-'), `留下 ${b4.name} / 丢掉 ${b4.droppedTags.join(',')}`);
   check('丢完之后仍在预算内', util.bbytes(b4.name) <= naming.DEFAULT_BUDGET_BYTES, `${util.bbytes(b4.name)} 字节`);
   check('uuid 与扩展名绝不被裁剪', b4.name.includes(id) && b4.name.endsWith('.mp4'), b4.name);
 
@@ -195,7 +197,8 @@ async function testTags() {
   eq('空白折叠', tagmod.normalizeTag('  助眠   音乐  '), '助眠 音乐');
   eq('逗号切分', JSON.stringify(tagmod.splitTagInput('a, b，c；d')), JSON.stringify(['a', 'b', 'c', 'd']));
   eq('大小写不敏感去重', JSON.stringify(tagmod.validateTags(['Fun', 'fun', 'FUN']).tags), JSON.stringify(['Fun']));
-  eq('排序稳定', JSON.stringify(tagmod.sortTags(['b', 'A', 'c'])), JSON.stringify(['A', 'b', 'c']));
+  eq('按顺序去重（留第一次的写法）', JSON.stringify(tagmod.uniqueTags(['b', 'A', 'c', 'a'])), JSON.stringify(['b', 'A', 'c']));
+  eq('集合比较用的排序仍然稳定', JSON.stringify(tagmod.sortTags(['b', 'A', 'c'])), JSON.stringify(['A', 'b', 'c']));
 }
 
 // ------------------------------------------------------------------ 3. 库：扫描 / 重命名 / 认领
@@ -234,32 +237,35 @@ async function testLibraryScanAndRename() {
   const video = db.items().find((i) => i.kind === 'video');
   const res = await library.applyTags(video.id, { mode: 'set', tags: ['美食', '助眠'] });
   check('applyTags 成功', res.ok, res.reason);
-  eq('改名后的文件名', res.item.name, `助眠-美食-${video.id}.mp4`);
+  eq('改名后的文件名（保持输入顺序）', res.item.name, `美食-助眠-${video.id}.mp4`);
   check('磁盘上确实只有这一个 mp4', fs.readdirSync(LIB).filter((n) => n.endsWith('.mp4')).length === 1);
   check('旧名字已经不在磁盘上', !fs.existsSync(path.join(LIB, untaggedNames.find((n) => n.endsWith('.mp4')))));
 
-  // 幂等：同样标签再存一次，不应改名
-  const again = await library.applyTags(video.id, { mode: 'set', tags: ['助眠', '美食'] });
-  eq('已经是目标名时不重复改名', again.rename.changed, false);
+  // 幂等：同样的标签、同样的顺序再存一次，不应改名
+  const again = await library.applyTags(video.id, { mode: 'set', tags: ['美食', '助眠'] });
+  eq('顺序没变时不重复改名', again.rename.changed, false);
+  const flipped = await library.applyTags(video.id, { mode: 'set', tags: ['助眠', '美食'] });
+  eq('只调整顺序也会改名', flipped.item.name, `助眠-美食-${video.id}.mp4`);
+  eq('调整顺序算一次改名', flipped.rename.changed, true);
 
   // 改标签 → 再改名
   const rename2 = await library.applyTags(video.id, { mode: 'set', tags: ['美食', '助眠', '睡前'] });
-  eq('加标签后文件名跟着变', rename2.item.name, `助眠-睡前-美食-${video.id}.mp4`);
+  eq('加标签后文件名跟着变', rename2.item.name, `美食-助眠-睡前-${video.id}.mp4`);
 
   // 移除标签
   const rm = await library.applyTags(video.id, { mode: 'remove', remove: ['睡前'] });
-  eq('移除标签后文件名回退', rm.item.name, `助眠-美食-${video.id}.mp4`);
+  eq('移除标签后文件名回退（剩下的顺序不变）', rm.item.name, `美食-助眠-${video.id}.mp4`);
 
   // 回归：applyTagsBulk 不传 mode 时，绝不能落到 applyTags 的默认 'set'
   // （set 走 next = tags || []，会把已有标签整批洗白 —— 真踩过：
   //   批量加标签把已打标签的素材标签清了，文件也不再跟着改名）
   const bulky = await library.applyTagsBulk([video.id], { add: ['批量加'] });
   eq('bulk 只给 add 时是「加」而不是「覆盖」', bulky.ok, true);
-  eq('原有标签没被洗掉', JSON.stringify(db.get(video.id).tags), JSON.stringify(['助眠', '批量加', '美食']));
-  eq('bulk 之后文件名也带上了新标签', db.get(video.id).name, `助眠-批量加-美食-${video.id}.mp4`);
+  eq('原有标签没被洗掉，新标签接在末尾', JSON.stringify(db.get(video.id).tags), JSON.stringify(['美食', '助眠', '批量加']));
+  eq('bulk 之后文件名也带上了新标签', db.get(video.id).name, `美食-助眠-批量加-${video.id}.mp4`);
   const bulkyRm = await library.applyTagsBulk([video.id], { remove: ['批量加'] });
   eq('bulk 只给 remove 时是「删」', bulkyRm.ok, true);
-  eq('删完回到原样', db.get(video.id).name, `助眠-美食-${video.id}.mp4`);
+  eq('删完回到原样', db.get(video.id).name, `美食-助眠-${video.id}.mp4`);
   const bulkySet = await library.applyTagsBulk([video.id], { mode: 'set', add: [] });
   eq('显式 mode=set 仍是覆盖语义', JSON.stringify(db.get(video.id).tags), JSON.stringify([]));
   await library.applyTags(video.id, { mode: 'set', tags: ['助眠', '美食'] });
@@ -652,7 +658,7 @@ async function testServer() {
       body: JSON.stringify({ mode: 'set', tags: ['片头', '开场'] }),
     })).json();
     check('打标签接口返回成功', tagged.ok === true, tagged.error);
-    eq('磁盘上的文件名已随之改变', tagged.item.name, `开场-片头-${vid.id}.mp4`);
+    eq('磁盘上的文件名已随之改变', tagged.item.name, `片头-开场-${vid.id}.mp4`);
     check('磁盘上确实有这个文件', fs.existsSync(path.join(serverLib, tagged.item.name)));
 
     // 改名之后，原始文件名必须还能查到 —— 这是用户"认得出哪个是哪个"的唯一线索
@@ -676,7 +682,7 @@ async function testServer() {
     const preview = await (await fetch(`${BASE}/api/items/${vid.id}/preview`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tags: ['开场', '片头', '尾声'] }),
     })).json();
-    check('预览接口给出新文件名', preview.preview.file.startsWith('开场-尾声-片头-') || preview.preview.file.includes('尾声'), preview.preview.file);
+    check('预览接口按传入顺序给文件名', preview.preview.file.startsWith('开场-片头-尾声-'), preview.preview.file);
 
     const tagsRes = await (await fetch(`${BASE}/api/tags`)).json();
     eq('标签列表里有 2 个标签', tagsRes.tags.length, 2);
@@ -739,7 +745,7 @@ async function testServer() {
     }
     eq('导出任务完成', final.status, 'done');
     eq('复制了 2 个文件', final.copied, 2);
-    check('导出的文件真的在目标目录里', fs.existsSync(path.join(final.destDir, `开场-片头-${vid.id}.mp4`)), listDisk(final.destDir).join(' | '));
+    check('导出的文件真的在目标目录里', fs.existsSync(path.join(final.destDir, `片头-开场-${vid.id}.mp4`)), listDisk(final.destDir).join(' | '));
 
     const csv = await httpGet(`/api/export/${jobId}/manifest.csv`);
     eq('清单可通过 HTTP 下载', csv.status, 200);
@@ -779,7 +785,7 @@ async function testServer() {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: '开场', to: '序章' }),
     })).json();
     check('全局改标签成功', renamed.ok === true, renamed.reason);
-    check('磁盘文件名已同步', fs.existsSync(path.join(serverLib, `序章-片头-${vid.id}.mp4`)), listDisk(serverLib).join(' | '));
+    check('磁盘文件名已同步（被改的标签留在原位置）', fs.existsSync(path.join(serverLib, `片头-序章-${vid.id}.mp4`)), listDisk(serverLib).join(' | '));
 
     const uniq = new Set(listDisk(serverLib).filter((n) => /[0-9a-f]{32}/.test(n)).map((n) => naming.parseIdFromName(n)));
     eq('目录里每个文件都有互不相同的 uuid', uniq.size, listDisk(serverLib).filter((n) => /[0-9a-f]{32}/.test(n)).length);

@@ -223,11 +223,11 @@ async function main() {
 
     check('「旅行-风景.mp4」被认成标签 [旅行, 风景]', Boolean(byKey['旅行-风景']), JSON.stringify(Object.keys(byKey)));
     check('「助眠-直播录屏-轻语.mp3」被认成三个标签', Boolean(byKey['助眠-直播录屏-轻语']));
-    // 标签会先按码点排序再拼进文件名，所以 "2024-08-23 直播录屏.mp4" 猜出来是 [08, 2024, 23 直播录屏]
+    // 建议保持文件名里的先后，不再按码点重排
     const dateKey = sug.groups.map((g) => g.tags.join('-')).find((k) => k.includes('2024') && k.includes('直播录屏'));
     check('「2024-08-23 直播录屏.mp4」也被当候选列出（这种名字程序分不清，交给用户判断）',
       Boolean(dateKey), JSON.stringify(Object.keys(byKey)));
-    if (dateKey) note(`这种名字猜出来的标签是 [${dateKey.split('-').join('|')}]（顺序按码点，所以 08 在最前）`);
+    if (dateKey) note(`这种名字猜出来的标签是 [${dateKey.split('-').join('|')}]（按文件名里的先后）`);
     const flatIds = sug.groups.flatMap((g) => g.ids);
     const all = await apiget('/api/items');
     const u1 = all.items.find((i) => i.id === U1);
