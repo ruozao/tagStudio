@@ -22,10 +22,11 @@ const { spawn, spawnSync } = require('child_process');
 const util = require('./lib/util');
 const naming = require('./lib/naming');
 const tagmod = require('./lib/tags');
-const { Database } = require('./lib/db');
+const { Database, rebuildTags } = require('./lib/db');
+const { Thumbnails } = require('./lib/thumbnails');
 const { Journal } = require('./lib/journal');
 const { Library } = require('./lib/library');
-const { Exports } = require('./lib/exporter');
+const { Exports, ExportJob } = require('./lib/exporter');
 const { crc32 } = require('./lib/zipcrc');
 
 const ROOT = __dirname;
@@ -782,6 +783,64 @@ async function testServer() {
 
     const uniq = new Set(listDisk(serverLib).filter((n) => /[0-9a-f]{32}/.test(n)).map((n) => naming.parseIdFromName(n)));
     eq('目录里每个文件都有互不相同的 uuid', uniq.size, listDisk(serverLib).filter((n) => /[0-9a-f]{32}/.test(n)).length);
+
+    // ---- 回归：跨站请求防护
+    const evil = await fetch(`${BASE}/api/scan`, { method: 'POST', headers: { Origin: 'http://evil.example' } });
+    eq('跨站 Origin 的写请求被拒（403）', evil.status, 403);
+    const same = await fetch(`${BASE}/api/scan`, { method: 'POST', headers: { Origin: BASE } });
+    eq('同源 Origin 的写请求照常放行', same.status, 200);
+    const rebind = await new Promise((resolve) => {
+      const r = require('http').request({ host: '127.0.0.1', port: APP_PORT, path: '/api/state', headers: { Host: `evil.example:${APP_PORT}` } }, (res) => {
+        res.resume();
+        resolve(res.statusCode);
+      });
+      r.on('error', () => resolve(-1));
+      r.end();
+    });
+    eq('Host 不是本机名（DNS 重绑定）时拒绝（403）', rebind, 403);
+
+    // ---- 回归：没写 mode、也没给 tags 的请求不能把标签清空
+    const before = (await (await fetch(`${BASE}/api/items/${vid.id}`)).json()).item;
+    const noTags = await fetch(`${BASE}/api/items/${vid.id}/tags`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
+    });
+    eq('既没 mode 也没 tags → 400', noTags.status, 400);
+    const afterNoTags = (await (await fetch(`${BASE}/api/items/${vid.id}`)).json()).item;
+    eq('标签没被清空', JSON.stringify(afterNoTags.tags), JSON.stringify(before.tags));
+    const addOnly = await (await fetch(`${BASE}/api/items/${vid.id}/tags`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ add: ['追加'] }),
+    })).json();
+    check('只给 add 时按「追加」处理，原有标签还在',
+      addOnly.ok && before.tags.every((t) => addOnly.item.tags.includes(t)) && addOnly.item.tags.includes('追加'), JSON.stringify(addOnly.item && addOnly.item.tags));
+    const bulkSet = await fetch(`${BASE}/api/items/bulk`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: [vid.id], mode: 'set' }),
+    });
+    eq('批量接口不接受 mode=set', bulkSet.status, 400);
+
+    // ---- 回归：体检「当前筛选」按完整筛选结果算，不受分页影响
+    const untaggedList = await (await fetch(`${BASE}/api/items?untagged=1`)).json();
+    const reviewF = await (await fetch(`${BASE}/api/export/review`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filter: { untagged: true } }),
+    })).json();
+    eq('体检按 filter 取素材，数量与筛选结果一致', reviewF.count, untaggedList.total);
+
+    // ---- 回归：任务结束后才连上 SSE，也要收到 end 并且连接会关闭
+    const quick = await (await fetch(`${BASE}/api/export/start`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: [vid.id], destRoot, subdir: 'SSE补发', nameMode: 'tagged' }),
+    })).json();
+    for (let i = 0; i < 40; i += 1) {
+      const j = await (await fetch(`${BASE}/api/export/${quick.job.id}`)).json();
+      if (j.job.status === 'done') break;
+      await sleep(100);
+    }
+    let sseText = '';
+    try {
+      sseText = await (await fetch(`${BASE}/api/export/${quick.job.id}/events`, { signal: AbortSignal.timeout(3000) })).text();
+    } catch (err) {
+      sseText = `超时：${err.message}`;
+    }
+    check('已结束任务的 SSE 会补发 end 并关闭连接', /event: end/.test(sseText), sseText.slice(0, 120));
   } finally {
     try { child.kill(); } catch { /* 忽略 */ }
     await sleep(400);
@@ -824,7 +883,6 @@ async function testRealVideos() {
   check('磁盘上的新名字符合规范', /^B站录屏-助眠-[0-9a-f]{32}\.mp4$/.test(res.item.name), res.item.name);
 
   // 抽一帧看看 ffmpeg 是否真能处理这些文件
-  const { Thumbnails } = require('./lib/thumbnails');
   const thumbs = new Thumbnails({ metaRoot: path.join(mediaLib, util.META_DIRNAME), rootOf: () => mediaLib, dbOf: () => db });
   await thumbs.init();
   const ff = await thumbs.ffmpeg();
@@ -971,6 +1029,311 @@ async function testSuggestions() {
     db.get(orphanId).tagSuggest === null, JSON.stringify(db.get(orphanId).tagSuggest));
 }
 
+// ------------------------------------------------------------------ 9. 回归：修过的 bug
+
+/** 用 .NET 自带的 ZipFile 读 zip（独立于我们自己的写入器），返回 [{name, length, sha1}] */
+function readZipWithDotNet(zipPath) {
+  const script = [
+    'Add-Type -AssemblyName System.IO.Compression.FileSystem;',
+    `$z = [System.IO.Compression.ZipFile]::OpenRead('${zipPath.replace(/'/g, "''")}');`,
+    '$sha = [System.Security.Cryptography.SHA1]::Create();',
+    '$out = @(); foreach ($e in $z.Entries) { $s = $e.Open(); $h = -join ($sha.ComputeHash($s) | ForEach-Object { $_.ToString("x2") }); $s.Close();',
+    '$out += [pscustomobject]@{ name = $e.FullName; length = $e.Length; sha1 = $h } }; $z.Dispose();',
+    '[Console]::OutputEncoding = [Text.Encoding]::UTF8; ConvertTo-Json -Compress @($out)',
+  ].join(' ');
+  const fullPath = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const bin = fs.existsSync(fullPath) ? fullPath : 'powershell.exe';
+  const r = spawnSync(bin, ['-NoProfile', '-Command', script], { encoding: 'utf8', windowsHide: true });
+  if (r.error) throw r.error;
+  if (r.status !== 0) throw new Error(r.stderr || `powershell 退出码 ${r.status}`);
+  const parsed = JSON.parse(r.stdout.trim());
+  return Array.isArray(parsed) ? parsed : [parsed];
+}
+
+async function testRegressions() {
+  group('9. 回归：修过的 bug 不再复发');
+
+  // uuid 只认本工具生成的形态（主干就是 uuid，或以 -uuid 结尾）
+  const hash = '5d41402abc4b2a76b9719d911017c592';
+  eq('原名中间夹带的 32 位 hex 不当成 uuid', naming.parseIdFromName(`IMG_${hash}.jpg`), null);
+  eq('uuid 不在主干末尾时不认', naming.parseIdFromName(`x-${hash}-尾巴.mp4`), null);
+  eq('纯 uuid 主干照样认', naming.parseIdFromName(`${hash}.jpg`), hash);
+
+  const lib = await freshDir(path.join(VDIR, 'regress-lib'));
+  await writeFile(path.join(lib, `IMG_${hash}.jpg`), 'img');
+  await writeFile(path.join(lib, '片段.mp4'), 'clip');
+  await writeFile(path.join(lib, '旅行-风景.mp4'), 'trip');
+  const { db, journal, library } = await makeLibrary(lib);
+  await library.scan({ rename: true, prune: true });
+  check('原名带 32 位 hex 的未打标签文件，扫描后文件名不变', fs.existsSync(path.join(lib, `IMG_${hash}.jpg`)), listDisk(lib).join(' | '));
+  const img = db.items().find((i) => i.name.startsWith('IMG_'));
+  eq('并且 origName 记的是完整原名', img && img.origName, `IMG_${hash}.jpg`);
+
+  // 清空标签时原名被占：退让成 原名(2)，而不是失败
+  const clip = db.items().find((i) => i.name === '片段.mp4');
+  const tagged = await library.applyTags(clip.id, { mode: 'set', tags: ['测试'] });
+  check('打标签后改成规范名', tagged.ok && tagged.item.name.startsWith('测试-'), tagged.reason);
+  await writeFile(path.join(lib, '片段.mp4'), '另一个同名文件');
+  const cleared = await library.applyTags(tagged.item.id, { mode: 'set', tags: [] });
+  check('原名被占时清空标签也能成功', cleared.ok === true, cleared.reason);
+  eq('退让成「原名(2)」', cleared.item && cleared.item.name, '片段(2).mp4');
+  eq('占着原名的那个文件没被动过', fs.readFileSync(path.join(lib, '片段.mp4'), 'utf8'), '另一个同名文件');
+
+  // 采纳建议时改名失败：标签要回滚
+  const trip = db.items().find((i) => i.name === '旅行-风景.mp4');
+  check('「旅行-风景.mp4」被认成建议', !!(trip && trip.tagSuggest), JSON.stringify(trip && trip.tagSuggest));
+  const realRename = library.renameItem;
+  library.renameItem = async () => ({ ok: false, reason: '模拟改名失败' });
+  let accepted;
+  try {
+    accepted = await library.acceptSuggestions([trip.id]);
+  } finally {
+    library.renameItem = realRename;
+  }
+  eq('改名失败时报告失败', accepted.failures.length, 1);
+  eq('改名失败时标签回滚为原样（空）', JSON.stringify(db.get(trip.id).tags), '[]');
+  check('文件名也没动', fs.existsSync(path.join(lib, '旅行-风景.mp4')), listDisk(lib).join(' | '));
+
+  // 原子写在同一毫秒内并发也不互相踩
+  const jf = path.join(VDIR, 'regress-concurrent.json');
+  const writes = await Promise.allSettled(Array.from({ length: 30 }, (_, i) => util.writeJsonAtomic(jf, { i })));
+  eq('30 次并发原子写全部成功', writes.filter((w) => w.status === 'rejected').length, 0);
+  check('最终文件是合法 JSON', (await util.readJson(jf, null)) !== null);
+
+  // 日志恢复：from 和 to 都在时两个都保留
+  const fromAbs = path.join(lib, '冲突-旧.mp4');
+  const toAbs = path.join(lib, '冲突-新.mp4');
+  await writeFile(fromAbs, 'from');
+  await writeFile(toAbs, 'to');
+  await journal.begin({ itemId: util.hex32(), from: fromAbs, to: toAbs, tags: [] });
+  const rec = await journal.recover();
+  eq('冲突被报出来', rec.conflict.length, 1);
+  check('from 没被删掉', fs.existsSync(fromAbs));
+  check('to 也还在', fs.existsSync(toAbs));
+  eq('日志已清掉', (await journal.pending()).length, 0);
+
+  // 批量操作：一批只落一次库，但结果必须和逐个落库完全一样
+  const bulkLib = await freshDir(path.join(VDIR, 'regress-bulk'));
+  for (let i = 0; i < 40; i += 1) await writeFile(path.join(bulkLib, `第${i}个.mp4`), String(i));
+  const B = await makeLibrary(bulkLib);
+  await B.library.scan({ rename: true, prune: true });
+  const bulkIds = B.db.items().slice(0, 25).map((i) => i.id);
+  const bulkRes = await B.library.applyTagsBulk(bulkIds, { add: ['甲', '乙'] });
+  eq('批量加标签全部成功', bulkRes.count, 25);
+  await B.library.applyTagsBulk(bulkIds.slice(0, 10), { remove: ['乙'] });
+  await B.library.renameTagGlobal('甲', '丙');
+  await B.library.mergeTags(['乙'], '丙');
+  await B.library.applyTags(bulkIds[0], { mode: 'set', tags: ['丁', 'Abc'] });
+  await B.library.applyTags(bulkIds[1], { mode: 'set', tags: ['ABC'] });
+  eq('批量之后没有残留日志', (await B.journal.pending()).length, 0);
+  const reloaded = new Database(path.join(bulkLib, util.META_DIRNAME));
+  await reloaded.load(bulkLib);
+  const diskMismatch = reloaded.items().filter((i) => {
+    const live = B.db.get(i.id);
+    return !live || live.name !== i.name || JSON.stringify(live.tags) !== JSON.stringify(i.tags);
+  });
+  eq('落盘的 db.json 与内存一致（批次结束时确实保存了）', diskMismatch.length, 0);
+  const nameMismatch = B.db.items().filter((i) => !fs.existsSync(path.join(bulkLib, i.rel)));
+  eq('每条记录都指向磁盘上真实存在的文件', nameMismatch.length, 0);
+  const counts = (tags) => JSON.stringify(Object.entries(tags).map(([k, v]) => [k, v.count]).sort());
+  const rebuilt = JSON.parse(JSON.stringify(B.db.db));
+  rebuildTags(rebuilt);
+  eq('增量维护的标签计数与全量重算一致', counts(B.db.db.tags), counts(rebuilt.tags));
+  eq('标签被摘光后从标签列表里消失', B.db.db.tags[tagmod.foldTag('甲')], undefined);
+
+  // 批处理中途「崩溃」：改名都做了，库却没来得及落盘 → 重开后按日志补齐，标签一个不丢
+  const crashLib = await freshDir(path.join(VDIR, 'regress-crash'));
+  for (let i = 0; i < 12; i += 1) await writeFile(path.join(crashLib, `崩${i}.mp4`), String(i));
+  const C = await makeLibrary(crashLib);
+  await C.library.scan({ rename: true, prune: true });
+  const crashIds = C.db.items().map((i) => i.id);
+  C.db.save = async () => { throw new Error('模拟断电'); };
+  let crashed = false;
+  try {
+    // 嵌套批次：同一批里每个文件先加标签、再被全局改名，各改两次
+    await C.library.batch(async () => {
+      await C.library.applyTagsBulk(crashIds, { add: ['崩前'] });
+      await C.library.renameTagGlobal('崩前', '崩后');
+    });
+  } catch (err) {
+    crashed = /模拟断电/.test(err.message);
+  }
+  check('模拟断电生效（批次结束时保存失败）', crashed);
+  check('断电时日志还留着', (await C.journal.pending()).length > 0);
+  const C2 = await makeLibrary(crashLib);
+  eq('重开时 db.json 还是旧的（没有标签）', C2.db.items().filter((i) => i.tags.length).length, 0);
+  await C2.library.recover();
+  const recovered = C2.db.items();
+  eq('恢复后素材数不变', recovered.length, 12);
+  eq('恢复后每个素材的标签都是最后一次的「崩后」', recovered.filter((i) => JSON.stringify(i.tags) === '["崩后"]').length, 12);
+  eq('恢复后每条记录都指向真实文件', recovered.filter((i) => !fs.existsSync(path.join(crashLib, i.rel))).length, 0);
+  eq('恢复后日志清空', (await C2.journal.pending()).length, 0);
+
+  // 目录浏览只数这一层
+  await writeFile(path.join(bulkLib, '子目录', '深处.mp4'), 'x');
+  await writeFile(path.join(bulkLib, '说明.txt'), 'x');
+  eq('countMediaFiles 只数这一层的媒体文件', await util.countMediaFiles(bulkLib), 40);
+
+  // 缩略图：用替身 ffmpeg 覆盖「短视频」「大图缩图」「失败记忆」三条分支
+  const thumbLib = await freshDir(path.join(VDIR, 'regress-thumb'));
+  await writeFile(path.join(thumbLib, '短片.mp4'), 'v');
+  await writeFile(path.join(thumbLib, '小图.png'), Buffer.alloc(1024, 1));
+  await writeFile(path.join(thumbLib, '大图.jpg'), Buffer.alloc(600 * 1024, 1));
+  await writeFile(path.join(thumbLib, '手机.heic'), Buffer.alloc(600 * 1024, 1));
+  await writeFile(path.join(thumbLib, '坏视频.mp4'), 'bad');
+  const T = await makeLibrary(thumbLib);
+  await T.library.scan({ rename: true, prune: true });
+  const byName = (n) => T.db.items().find((i) => i.name === n);
+  const thumbs = new Thumbnails({ metaRoot: path.join(thumbLib, util.META_DIRNAME), rootOf: () => thumbLib, dbOf: () => T.db });
+  await thumbs.init();
+  thumbs.ffmpegChecked = true;
+  thumbs.ffmpegPath = 'fake-ffmpeg';
+  const calls = [];
+  thumbs.run = async (_bin, args) => {
+    calls.push(args);
+    const input = args[args.indexOf('-i') + 1];
+    if (input.endsWith('坏视频.mp4')) return false;
+    // 短于 3 秒的视频：-ss 3 时 ffmpeg 退出码 0 却不写文件
+    if (input.endsWith('短片.mp4') && args.includes('3')) return true;
+    fs.writeFileSync(args[args.length - 1], Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+    return true;
+  };
+  const shortRes = await thumbs.ensure(byName('短片.mp4').id);
+  check('短视频：-ss 3 没出图时退回 -ss 0.5 并成功', shortRes.ok && shortRes.mime === 'image/jpeg', JSON.stringify(shortRes));
+  const small = await thumbs.ensure(byName('小图.png').id);
+  check('小图直接用原图', small.ok && small.source.endsWith('小图.png'), JSON.stringify(small));
+  const big = await thumbs.ensure(byName('大图.jpg').id);
+  check('大图生成 jpg 缩略图', big.ok && big.source.startsWith(thumbs.dir), JSON.stringify(big));
+  check('缩图不放大（scale 用 min(480,iw)）', calls.some((a) => a.includes("scale='min(480,iw)':-2")));
+  const heic = await thumbs.ensure(byName('手机.heic').id);
+  check('HEIC 也能生成缩略图', heic.ok && heic.mime === 'image/jpeg', JSON.stringify(heic));
+  const before = calls.length;
+  const bad1 = await thumbs.ensure(byName('坏视频.mp4').id);
+  const afterFirst = calls.length;
+  const bad2 = await thumbs.ensure(byName('坏视频.mp4').id);
+  check('坏视频报失败', !bad1.ok && !bad2.ok);
+  eq('坏视频第一次试了 3 次 ffmpeg', afterFirst - before, 3);
+  eq('文件没变时第二次不再跑 ffmpeg', calls.length - afterFirst, 0);
+  const noFf = new Thumbnails({ metaRoot: path.join(thumbLib, util.META_DIRNAME), rootOf: () => thumbLib, dbOf: () => T.db });
+  noFf.ffmpegChecked = true;
+  noFf.ffmpegPath = null;
+  await fsp.rm(thumbs.fileFor(byName('大图.jpg').id), { force: true });
+  await fsp.rm(thumbs.fileFor(byName('手机.heic').id), { force: true });
+  const bigNoFf = await noFf.ensure(byName('大图.jpg').id);
+  check('没有 ffmpeg 时大图退回原图', bigNoFf.ok && bigNoFf.source.endsWith('大图.jpg'), JSON.stringify(bigNoFf));
+  const heicNoFf = await noFf.ensure(byName('手机.heic').id);
+  eq('没有 ffmpeg 时 HEIC 报没有缩略图（浏览器显示不了原图）', heicNoFf.code, 404);
+
+  // zip：普通 + 强制 ZIP64，都交给 .NET 的 ZipFile 独立解开校验
+  if (process.platform !== 'win32') {
+    note('非 Windows：跳过 .NET ZipFile 交叉校验');
+    return;
+  }
+  await writeFile(path.join(lib, '大一点.bin'), Buffer.alloc(3 * 1024 * 1024 + 17, 9));
+  await library.scan({ rename: true, prune: true });
+  const zipItems = db.items();
+  const sha1 = (p) => require('crypto').createHash('sha1').update(fs.readFileSync(p)).digest('hex');
+  for (const [label, threshold] of [['普通 zip', null], ['ZIP64（阈值调到 1 字节强制走 ZIP64 分支）', 1]]) {
+    const dest = await freshDir(path.join(VDIR, `regress-zip-${threshold || 'std'}`));
+    const job = new ExportJob({ id: 'z', items: zipItems, destRoot: dest, subdir: 'z', nameMode: 'tagged', makeZip: true, db });
+    if (threshold) job.zip64Threshold = threshold;
+    const snap = await job.run();
+    eq(`${label}：导出完成`, snap.status, 'done');
+    let entries = [];
+    try {
+      entries = readZipWithDotNet(snap.zipPath);
+    } catch (err) {
+      check(`${label}：.NET 能打开`, false, err.message);
+      continue;
+    }
+    eq(`${label}：条目数`, entries.length, zipItems.length);
+    const allSame = entries.every((e) => sha1(path.join(snap.destDir, e.name)) === e.sha1);
+    check(`${label}：每个条目解开后与导出文件逐字节一致`, allSame, JSON.stringify(entries));
+  }
+}
+
+// ------------------------------------------------------------------ 10. 真 ffmpeg 缩略图
+
+async function testRealFfmpegThumbs() {
+  group('10. 真 ffmpeg：现场生成的视频 / 图片抽缩略图');
+  const probe = new Thumbnails({ metaRoot: path.join(VDIR, 'ff-probe'), rootOf: () => VDIR, dbOf: () => null });
+  const ff = await probe.ffmpeg();
+  if (!ff) {
+    note('没找到 ffmpeg（PATH / FFMPEG_PATH / bin 目录都没有），跳过');
+    return;
+  }
+  note(`ffmpeg：${ff}`);
+  const ffprobe = path.join(path.dirname(ff), process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe');
+  const gen = (out, args) => {
+    const r = spawnSync(ff, ['-hide_banner', '-loglevel', 'error', '-y', ...args, out], { windowsHide: true });
+    return r.status === 0 && fs.existsSync(out);
+  };
+  const dims = (file) => {
+    const r = spawnSync(ffprobe, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', file], { encoding: 'utf8', windowsHide: true });
+    const [w, h] = String(r.stdout || '').trim().split(',').map(Number);
+    return { w, h };
+  };
+
+  const lib = await freshDir(path.join(VDIR, 'ff-lib'));
+  const made = {
+    '一秒短片.mp4': gen(path.join(lib, '一秒短片.mp4'), ['-f', 'lavfi', '-i', 'testsrc=duration=1:size=640x360:rate=25', '-pix_fmt', 'yuv420p']),
+    '五秒横屏.mp4': gen(path.join(lib, '五秒横屏.mp4'), ['-f', 'lavfi', '-i', 'testsrc=duration=5:size=1280x720:rate=25', '-pix_fmt', 'yuv420p']),
+    '纯音频.mp4': gen(path.join(lib, '纯音频.mp4'), ['-f', 'lavfi', '-i', 'sine=duration=2', '-c:a', 'aac']),
+    '大照片.jpg': gen(path.join(lib, '大照片.jpg'), ['-f', 'lavfi', '-i', 'color=c=gray:s=2400x1600', '-vf', 'noise=alls=80:allf=t', '-frames:v', '1', '-q:v', '1']),
+    '窄长图.jpg': gen(path.join(lib, '窄长图.jpg'), ['-f', 'lavfi', '-i', 'color=c=gray:s=300x4000', '-vf', 'noise=alls=80:allf=t', '-frames:v', '1', '-q:v', '1']),
+    '小图标.png': gen(path.join(lib, '小图标.png'), ['-f', 'lavfi', '-i', 'color=c=blue:s=64x64', '-frames:v', '1']),
+  };
+  check('测试素材都生成出来了', Object.values(made).every(Boolean), JSON.stringify(made));
+  const bigSize = fs.statSync(path.join(lib, '大照片.jpg')).size;
+  check('大照片确实超过 512KB（走缩图分支）', bigSize > 512 * 1024, util.humanBytes(bigSize));
+  check('窄长图也超过 512KB', fs.statSync(path.join(lib, '窄长图.jpg')).size > 512 * 1024);
+
+  const { db, library } = await makeLibrary(lib);
+  await library.scan({ rename: true, prune: true });
+  const thumbs = new Thumbnails({ metaRoot: path.join(lib, util.META_DIRNAME), rootOf: () => lib, dbOf: () => db });
+  await thumbs.init();
+  const get = (n) => db.items().find((i) => i.name === n);
+  const isJpeg = (file) => fs.readFileSync(file).slice(0, 2).toString('hex') === 'ffd8';
+
+  const t0 = Date.now();
+  const short = await thumbs.ensure(get('一秒短片.mp4').id);
+  check('1 秒短视频抽出了缩略图（-ss 3 超出时长后自动退回）', short.ok && isJpeg(short.source), JSON.stringify(short));
+  if (short.ok) eq('短视频缩略图宽 480', dims(short.source).w, 480);
+
+  const long = await thumbs.ensure(get('五秒横屏.mp4').id);
+  check('5 秒视频抽出了缩略图', long.ok && isJpeg(long.source), JSON.stringify(long));
+  if (long.ok) {
+    const d = dims(long.source);
+    check('视频缩略图 480 宽、保持 16:9', d.w === 480 && d.h === 270, JSON.stringify(d));
+  }
+
+  const big = await thumbs.ensure(get('大照片.jpg').id);
+  check('大照片生成了缩略图（不是原图）', big.ok && big.source.startsWith(thumbs.dir) && isJpeg(big.source), JSON.stringify(big));
+  if (big.ok) {
+    const d = dims(big.source);
+    check('大照片缩到 480 宽、保持 3:2', d.w === 480 && d.h === 320, JSON.stringify(d));
+    const thumbSize = fs.statSync(big.source).size;
+    check('缩略图比原图小得多', thumbSize * 10 < bigSize, `${util.humanBytes(thumbSize)} vs ${util.humanBytes(bigSize)}`);
+  }
+
+  const narrow = await thumbs.ensure(get('窄长图.jpg').id);
+  check('窄长图生成了缩略图', narrow.ok && narrow.source.startsWith(thumbs.dir), JSON.stringify(narrow));
+  if (narrow.ok) eq('比 480 窄的图不放大（宽仍是 300）', dims(narrow.source).w, 300);
+
+  const icon = await thumbs.ensure(get('小图标.png').id);
+  check('小图直接用原图', icon.ok && icon.source.endsWith('小图标.png'), JSON.stringify(icon));
+
+  const audio = await thumbs.ensure(get('纯音频.mp4').id);
+  check('没有视频轨的 mp4 明确报失败而不是挂住', !audio.ok, JSON.stringify(audio));
+  const tAudio = Date.now();
+  const audio2 = await thumbs.ensure(get('纯音频.mp4').id);
+  check('再次请求直接返回记住的失败（不再跑 ffmpeg）', !audio2.ok && Date.now() - tAudio < 50, `${Date.now() - tAudio}ms`);
+
+  const cachedAgain = await thumbs.ensure(get('五秒横屏.mp4').id);
+  eq('第二次请求命中磁盘缓存', cachedAgain.source, long.source);
+  note(`真 ffmpeg 生成全部缩略图用时 ${Date.now() - t0} ms`);
+}
+
 // ------------------------------------------------------------------ 主流程
 
 async function main() {
@@ -986,6 +1349,8 @@ async function main() {
   await testJournalRecovery();
   await testExport();
   await testSuggestions();
+  await testRegressions();
+  if (!QUICK) await testRealFfmpegThumbs();
   if (!QUICK) await testServer();
   else note('--quick：跳过 HTTP 服务验证');
   if (!QUICK) await testRealVideos();

@@ -1080,15 +1080,7 @@ async function updateExpEstimate() {
   const box = $('#expReview');
   box.innerHTML = '';
   try {
-    // review 接口的语义：给了 ids 就只体检这些；没给 ids 就体检整个库。
-    // 所以「当前筛选」这一档要先把筛选结果拉出来，否则会体检成整库。
-    let ids = null;
-    if (exportScope.mode === 'selected') ids = [...S.selection];
-    else if (exportScope.mode === 'filter') {
-      const r = await api(`/api/items?${queryString().replace(/&?offset=\d+/, '&offset=0')}`);
-      ids = (r.items || []).map((i) => i.id);
-    }
-    const res = await api('/api/export/review', { method: 'POST', body: ids ? { ids } : {} });
+    const res = await api('/api/export/review', { method: 'POST', body: exportScopeBody() });
     const add = (k, v) => { box.appendChild(el('div', 'k', k)); box.appendChild(el('div', 'v', v)); };
     add('将复制', `${res.count} 个文件，共 ${humanBytes(res.totalBytes)}`);
     add('缺失源文件', res.missing.length ? `${res.missing.length} 个（会被跳过）` : '无');
@@ -1097,6 +1089,23 @@ async function updateExpEstimate() {
   } catch (err) {
     box.appendChild(el('div', 'v', `体检失败：${err.message}`));
   }
+}
+
+/**
+ * 导出范围 → 请求体。体检和真正导出都用它，服务端按同一套规则取素材：
+ * 给 ids 就只要这些；给 filter 就取筛选结果的全部（不分页）；都不给 = 整个库。
+ */
+function exportScopeBody() {
+  if (exportScope.mode === 'selected') return { ids: [...S.selection] };
+  if (exportScope.mode === 'filter') {
+    // 没加任何筛选时不传 filter，服务端按"整个库"处理
+    const f = { ...S.filters };
+    const hasFilter = (f.tags && f.tags.length) || (f.any && f.any.length) || f.kind || f.untagged || f.q;
+    if (hasFilter) return { filter: f };
+  }
+  // mode === 'all'：既不给 ids 也不给 filter。
+  // （不能传 S.items.map(...)，那只是"当前这一页"的素材，翻页后就会漏。）
+  return {};
 }
 
 function stamp() {
@@ -1116,17 +1125,8 @@ async function startExport() {
     subdir: subdir || null,
     nameMode,
     makeZip,
+    ...exportScopeBody(),
   };
-  if (exportScope.mode === 'selected') body.ids = [...S.selection];
-  else if (exportScope.mode === 'filter') {
-    // 当前没有加任何筛选时 filter 是空对象；空筛选 = 不限制，服务端会按"整个库"处理。
-    // 这里也把空对象去掉，语义更直白。
-    const f = { ...S.filters };
-    const hasFilter = (f.tags && f.tags.length) || (f.any && f.any.length) || f.kind || f.untagged || f.q;
-    if (hasFilter) body.filter = f;
-  }
-  // mode === 'all'：既不给 ids 也不给 filter，服务端会把整个库导出去。
-  // （以前这里传的是 S.items.map(...)，而那只是"当前这一页"的素材，翻页后就会漏。）
 
   try {
     const res = await api('/api/export/start', { method: 'POST', body });
@@ -1238,7 +1238,7 @@ async function listDir(p) {
   try {
     const res = await api(`/api/fs/list?path=${encodeURIComponent(p)}`);
     browserPath = res.path;
-    $('#brPath').textContent = `${res.path}   （这里能扫到 ${res.mediaCount} 个媒体文件）`;
+    $('#brPath').textContent = `${res.path}   （这一层有 ${res.mediaCount} 个媒体文件，子文件夹里的也会一起扫描）`;
     const box = $('#brList');
     box.innerHTML = '';
     if (!res.dirs.length) box.appendChild(el('div', 'muted small', '（没有子文件夹）'));

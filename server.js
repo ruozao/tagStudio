@@ -18,6 +18,7 @@ const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
 const { spawn } = require('child_process');
+const { pipeline } = require('stream');
 
 const util = require('./lib/util');
 const { Database } = require('./lib/db');
@@ -72,6 +73,19 @@ const state = {
   scanTimer: null,
   scanInterval: 45000,
 };
+
+/**
+ * 所有会改库（改名 / 改标签 / 扫描 / 切库）的操作排成一队执行。
+ * 扫描是「先遍历磁盘、再对账」，中间要是插进来一次改名，对账就会拿着旧文件列表
+ * 把记录指回已经不存在的路径，甚至当成文件丢了把记录剔掉。
+ * 注意：被 exclusive 包住的函数里不能再调 exclusive，否则会自己等自己。
+ */
+let writeQueue = Promise.resolve();
+function exclusive(fn) {
+  const run = writeQueue.then(() => fn());
+  writeQueue = run.catch(() => {});
+  return run;
+}
 
 async function loadConfig() {
   await util.ensureDir(DATA_DIR);
@@ -133,7 +147,11 @@ async function mount(root, opts = {}) {
   const exports = new Exports({ metaRoot, rootOf: () => state.root, dbOf: () => state.db });
   await exports.init();
 
-  const previousRoot = state.root;
+  // 恢复和首次扫描都只依赖新建的这几个对象，先做完再切换全局状态：
+  // 中途失败时旧库照常可用，不会留下一个「state 指向新库、新库却没开成」的半成品。
+  const recovery = await library.recover();
+  const scan = await library.scan({ rename: true, prune: true });
+
   state.root = absRoot;
   state.db = db;
   state.library = library;
@@ -141,17 +159,11 @@ async function mount(root, opts = {}) {
   state.thumbs = thumbs;
   state.exports = exports;
   state.bootError = null;
-
-  const recovery = await library.recover();
-  const scan = await library.scan({ rename: true, prune: true });
   state.lastScan = scan;
   state.ready = true;
 
   await saveConfig({ lastRoot: absRoot, recentRoots: rememberRoot(absRoot) });
   scheduleScan();
-  if (previousRoot && path.resolve(previousRoot) !== absRoot) {
-    // 切换库：旧库的缓存目录跟着旧库走，不需要额外清理
-  }
   return { root: absRoot, recovery, scan };
 }
 
@@ -161,7 +173,7 @@ function scheduleScan() {
   state.scanTimer = setInterval(async () => {
     if (!state.ready) return;
     try {
-      const res = await state.library.scan({ rename: true, prune: true });
+      const res = await exclusive(() => state.library.scan({ rename: true, prune: true }));
       if (res.added || res.removed || res.matched || res.renamed) state.lastScan = res;
     } catch (err) {
       process.stderr.write(`[scan] ${err && err.message}\n`);
@@ -208,6 +220,14 @@ async function readBody(req, limit = 4 * 1024 * 1024) {
   }
 }
 
+/** 请求没写 mode 时按带了哪个字段来推断；add/remove 都没带才算 set */
+function inferTagMode(body) {
+  const has = (v) => (Array.isArray(v) ? v.length > 0 : !!v);
+  if (has(body.add)) return 'add';
+  if (has(body.remove)) return 'remove';
+  return 'set';
+}
+
 function staticFile(res, absPath, opts = {}) {
   return fsp.stat(absPath).then((st) => {
     if (!st.isFile()) {
@@ -220,7 +240,7 @@ function staticFile(res, absPath, opts = {}) {
       'Content-Length': st.size,
       'Cache-Control': opts.cache || 'no-cache',
     });
-    fs.createReadStream(absPath).pipe(res);
+    pipeline(fs.createReadStream(absPath), res, () => {});
     return undefined;
   }).catch(() => {
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -255,8 +275,8 @@ function streamFile(req, res, absPath, opts = {}) {
       res.end();
       return;
     }
-    const stream = fs.createReadStream(null, { fd, autoClose: true });
-    stream.pipe(res);
+    // pipeline 而不是 pipe：客户端中途断开（拖进度条时很常见）也会销毁读流、关掉 fd
+    pipeline(fs.createReadStream(null, { fd, autoClose: true }), res, () => {});
     return;
   }
 
@@ -298,9 +318,7 @@ function streamFile(req, res, absPath, opts = {}) {
     res.end();
     return;
   }
-  const stream = fs.createReadStream(null, { fd, start, end, autoClose: true });
-  stream.on('error', () => res.destroy());
-  stream.pipe(res);
+  pipeline(fs.createReadStream(null, { fd, start, end, autoClose: true }), res, () => {});
 }
 
 // ------------------------------------------------------------------ 路由
@@ -372,7 +390,7 @@ route('POST', /^\/api\/library\/boot$/, async (req) => {
   if (!root) throw new ApiError(400, '请填写素材文件夹的完整路径');
   if (body.create === false && !(await util.exists(root))) throw new ApiError(404, `目录不存在：${root}`);
   try {
-    const result = await mount(root, { create: body.create !== false });
+    const result = await exclusive(() => mount(root, { create: body.create !== false }));
     return { ok: true, ...result, stats: state.db.stats() };
   } catch (err) {
     state.bootError = String(err && err.message);
@@ -409,7 +427,8 @@ route('GET', /^\/api\/fs\/list$/, async (req) => {
     path: dir,
     parent: parent === dir ? null : parent,
     dirs,
-    mediaCount: (await util.walkFiles(dir, { maxFiles: 5000 })).length,
+    // 只数这一层：浏览到 C:\ 这种目录时递归数一遍要好几秒，每点一层都要等
+    mediaCount: await util.countMediaFiles(dir),
   };
 });
 
@@ -422,7 +441,7 @@ route('POST', /^\/api\/fs\/pick-folder$/, async (req) => {
 
 route('POST', /^\/api\/scan$/, async () => {
   requireLibrary();
-  const result = await state.library.scan({ rename: true, prune: true });
+  const result = await exclusive(() => state.library.scan({ rename: true, prune: true }));
   state.lastScan = result;
   return result;
 });
@@ -439,7 +458,8 @@ route('GET', /^\/api\/items$/, async (req) => {
   const untagged = q.get('untagged') === '1';
   const search = q.get('q') || '';
   const offset = Number(q.get('offset') || 0);
-  const limit = Math.min(2000, Number(q.get('limit') || 0));
+  // 不传或传 0 都按上限 2000 处理，否则一次把几万条全序列化出去
+  const limit = Math.min(2000, Math.max(0, Number(q.get('limit')) || 0) || 2000);
   const sort = q.get('sort') || 'added-desc';
   const result = state.db.query({ tags, any, kind, untagged, q: search, offset, limit, sort });
   return {
@@ -465,13 +485,16 @@ route('GET', /^\/api\/items\/([0-9a-fA-F]{32})$/, async (req, _url, id) => {
 route('POST', /^\/api\/items\/([0-9a-fA-F]{32})\/tags$/, async (req, _url, id) => {
   requireLibrary();
   const body = await readBody(req);
-  const mode = body.mode || 'set';
-  const res = await state.library.applyTags(id, {
+  const mode = body.mode || inferTagMode(body);
+  if (!['set', 'add', 'remove'].includes(mode)) throw new ApiError(400, `未知的 mode：${mode}`);
+  // set 是「整体覆盖」：没带 tags 字段就当成「清空」太危险，宁可报错
+  if (mode === 'set' && body.tags === undefined) throw new ApiError(400, 'mode=set 需要提供 tags（要清空请传空数组）');
+  const res = await exclusive(() => state.library.applyTags(id, {
     mode,
     tags: Array.isArray(body.tags) ? body.tags : tagsMod.splitTagInput(body.tags),
     add: Array.isArray(body.add) ? body.add : (body.add ? tagsMod.splitTagInput(body.add) : []),
     remove: Array.isArray(body.remove) ? body.remove : (body.remove ? tagsMod.splitTagInput(body.remove) : []),
-  });
+  }));
   if (!res.ok) throw new ApiError(res.code || 400, res.reason);
   return { ...res, item: state.library.itemView(res.item), stats: state.db.stats() };
 });
@@ -494,12 +517,14 @@ route('POST', /^\/api\/items\/bulk$/, async (req) => {
   const body = await readBody(req);
   const ids = (body.ids || []).map(String);
   if (!ids.length) throw new ApiError(400, '没有选中任何素材');
-  const mode = body.mode || 'add';
-  const res = await state.library.applyTagsBulk(ids, {
+  const mode = body.mode || inferTagMode(body);
+  // 批量只支持加/删：批量 set 会把一批素材原有的标签整体覆盖掉，界面上也没有这个入口
+  if (!['add', 'remove'].includes(mode)) throw new ApiError(400, '批量操作需要 mode=add 或 mode=remove');
+  const res = await exclusive(() => state.library.applyTagsBulk(ids, {
     mode,
     add: Array.isArray(body.add) ? body.add : tagsMod.splitTagInput(body.add || ''),
     remove: Array.isArray(body.remove) ? body.remove : tagsMod.splitTagInput(body.remove || ''),
-  });
+  }));
   return { ...res, stats: state.db.stats(), tags: state.db.tagList() };
 });
 
@@ -542,7 +567,7 @@ route('POST', /^\/api\/suggestions\/accept$/, async (req) => {
   if (!ids.length) ids = state.library.suggestions().groups.flatMap((g) => g.ids);
   if (!ids.length) return { ok: true, accepted: 0, skipped: 0, failures: [], remaining: 0, stats: state.db.stats(), tags: state.db.tagList() };
   const tags = Array.isArray(body.tags) ? body.tags : (body.tags ? tagsMod.splitTagInput(body.tags) : null);
-  const res = await state.library.acceptSuggestions(ids, { tags, tagMap });
+  const res = await exclusive(() => state.library.acceptSuggestions(ids, { tags, tagMap }));
   return { ...res, stats: state.db.stats(), tags: state.db.tagList() };
 });
 
@@ -551,7 +576,7 @@ route('POST', /^\/api\/suggestions\/ignore$/, async (req) => {
   const body = await readBody(req);
   let ids = Array.isArray(body.ids) ? body.ids.map(String) : [];
   if (!ids.length) ids = state.library.suggestions().groups.flatMap((g) => g.ids);
-  const res = await state.library.ignoreSuggestions(ids);
+  const res = await exclusive(() => state.library.ignoreSuggestions(ids));
   return { ...res, stats: state.db.stats() };
 });
 
@@ -565,7 +590,7 @@ route('GET', /^\/api\/tags$/, async () => {
 route('POST', /^\/api\/tags\/rename$/, async (req) => {
   requireLibrary();
   const body = await readBody(req);
-  const res = await state.library.renameTagGlobal(body.from, body.to, { dryRun: !!body.dryRun });
+  const res = await exclusive(() => state.library.renameTagGlobal(body.from, body.to, { dryRun: !!body.dryRun }));
   if (!res.ok) throw new ApiError(400, res.reason);
   return { ...res, stats: state.db.stats() };
 });
@@ -573,24 +598,26 @@ route('POST', /^\/api\/tags\/rename$/, async (req) => {
 route('POST', /^\/api\/tags\/merge$/, async (req) => {
   requireLibrary();
   const body = await readBody(req);
-  const res = await state.library.mergeTags(body.sources || [], body.target);
+  const res = await exclusive(() => state.library.mergeTags(body.sources || [], body.target));
   return { ...res, stats: state.db.stats() };
 });
 
 route('POST', /^\/api\/tags\/delete$/, async (req) => {
   requireLibrary();
   const body = await readBody(req);
-  const res = await state.library.deleteTagGlobal(body.name);
+  const res = await exclusive(() => state.library.deleteTagGlobal(body.name));
   return { ...res, stats: state.db.stats() };
 });
 
 route('POST', /^\/api\/collections$/, async (req) => {
   requireLibrary();
   const body = await readBody(req);
-  const res = state.db.setCollections(body.collections || body);
-  if (!res.ok) throw new ApiError(400, res.reason);
-  await state.db.save();
-  return { ok: true, collections: res.collections };
+  return exclusive(async () => {
+    const res = state.db.setCollections(body.collections || body);
+    if (!res.ok) throw new ApiError(400, res.reason);
+    await state.db.save();
+    return { ok: true, collections: res.collections };
+  });
 });
 
 // --- 缩略图 / 媒体流 -----------------------------------------------------
@@ -641,28 +668,32 @@ route('GET', /^\/api\/media\/([0-9a-fA-F]{32})$/, async (req, res, id) => {
 
 // --- 导出 ---------------------------------------------------------------
 
-route('POST', /^\/api\/export\/start$/, async (req) => {
-  requireLibrary();
-  const body = await readBody(req);
+/** 导出范围：导出本身和导出前体检共用，保证体检的就是将要导出的那一批 */
+function exportItemsOf(body) {
   const ids = (body.ids || []).map(String);
-  let items;
   if (ids.length) {
     // 明确点了名的素材优先，一个都不能少（点名的 id 找不到就跳过，不报错）
-    items = ids.map((id) => state.db.get(id)).filter(Boolean);
-  } else if (body.filter && Object.keys(body.filter).length) {
-    // 只给了筛选条件：导出"当前视图里的全部"
+    return ids.map((id) => state.db.get(id)).filter(Boolean);
+  }
+  if (body.filter && Object.keys(body.filter).length) {
+    // 只给了筛选条件：导出"当前视图里的全部"（不分页）
     const f = body.filter;
-    items = state.db.query({
+    return state.db.query({
       tags: f.tags || [],
       any: f.any || [],
       kind: f.kind || '',
       untagged: !!f.untagged,
       q: f.q || '',
     }).items;
-  } else {
-    // 既没点名也没给条件 = 把整个库导出去（界面上"全部素材"那个范围）
-    items = state.db.items();
   }
+  // 既没点名也没给条件 = 把整个库导出去（界面上"全部素材"那个范围）
+  return state.db.items();
+}
+
+route('POST', /^\/api\/export\/start$/, async (req) => {
+  requireLibrary();
+  const body = await readBody(req);
+  const items = exportItemsOf(body);
   if (!items.length) throw new ApiError(400, '没有选中任何素材');
   const destRoot = path.resolve(String(body.destRoot || state.exports.defaultRoot));
   await util.ensureDir(destRoot);
@@ -690,6 +721,12 @@ route('GET', /^\/api\/export\/([0-9a-zA-Z]+)\/events$/, async (req, res, id) => 
   }
   util.sseInit(res);
   util.sseSend(res, 'progress', job.snapshot());
+  // 小批量导出可能在浏览器连上来之前就结束了，'end' 事件已经错过，这里直接补发
+  if (job.finishedAt) {
+    util.sseSend(res, 'end', job.snapshot());
+    res.end();
+    return undefined;
+  }
   const onProgress = (snap) => util.sseSend(res, 'progress', snap);
   const onEnd = (snap) => {
     util.sseSend(res, 'end', snap);
@@ -750,8 +787,7 @@ route('POST', /^\/api\/export\/review$/, async (req) => {
   // 「导出前体检」：把会被改名、会超长、源文件缺失的情况先报出来
   requireLibrary();
   const body = await readBody(req);
-  const ids = (body.ids || []).map(String);
-  const items = ids.length ? ids.map((id) => state.db.get(id)).filter(Boolean) : state.db.items();
+  const items = exportItemsOf(body);
   const missing = [];
   const long = [];
   const droppedTags = [];
@@ -829,6 +865,34 @@ function contentDisposition(filename) {
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
 }
 
+const LOCAL_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+function hostnameOf(hostHeader) {
+  return String(hostHeader || '').toLowerCase().replace(/:\d+$/, '');
+}
+
+/**
+ * 只监听 127.0.0.1 挡不住「用户浏览器里打开的别的网页」：
+ *   - 跨站页面可以直接对本服务发 POST（改名、建库、往任意目录导出）；
+ *   - DNS 重绑定能让外部域名解析到 127.0.0.1，连 GET 的响应都读得到。
+ * 所以 Host 必须是本机名；写操作如果带了 Origin（浏览器跨站时一定会带），必须与 Host 同源。
+ * 返回拒绝原因，放行时返回 null。
+ */
+function requestGuard(req) {
+  if (!LOCAL_HOSTNAMES.has(hostnameOf(req.headers.host))) return '只接受来自本机地址的访问';
+  if (req.method === 'GET' || req.method === 'HEAD') return null;
+  const origin = req.headers.origin;
+  if (origin === undefined) return null;
+  let originHost;
+  try {
+    originHost = new URL(origin).host.toLowerCase();
+  } catch {
+    return '拒绝跨站请求';
+  }
+  if (originHost !== String(req.headers.host || '').toLowerCase()) return '拒绝跨站请求';
+  return null;
+}
+
 // ------------------------------------------------------------------ 主循环
 
 const server = http.createServer(async (req, res) => {
@@ -839,6 +903,12 @@ const server = http.createServer(async (req, res) => {
     pathname = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`).pathname;
   } catch {
     sendError(res, 400, '非法 URL');
+    return;
+  }
+
+  const guard = requestGuard(req);
+  if (guard) {
+    sendError(res, 403, guard);
     return;
   }
 
