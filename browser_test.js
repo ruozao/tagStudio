@@ -491,7 +491,13 @@ async function main() {
       await evaluate(session, `[...document.querySelectorAll('#grid .card .name')].map(x => x.textContent).join(' | ')`));
 
     const diskAfterBulk = await fsp.readdir(LIBDIR).catch(() => []);
-    check('磁盘上 3 个文件都带「归档」前缀', diskAfterBulk.filter((n) => n.startsWith('归档-')).length === 3, diskAfterBulk.join(' | '));
+    const mediaAfterBulk = diskAfterBulk.filter((n) => /\.(mp3|mp4|png|jpg|jpeg|webp)$/i.test(n));
+    // 批量加标签是「追加」：原来没标签的两个文件变成「归档-uuid」，
+    // 已经叫「旅行-海边的日落-uuid」的那个接在末尾，不抢原来的主标签。
+    check('批量加标签：原来没标签的两个文件变成「归档-uuid」',
+      mediaAfterBulk.filter((n) => n.startsWith('归档-')).length === 2, diskAfterBulk.join(' | '));
+    check('批量加标签：已有标签的那个接在末尾（旅行-海边的日落-归档-uuid）',
+      mediaAfterBulk.some((n) => n.startsWith('旅行-海边的日落-归档-')), diskAfterBulk.join(' | '));
     note(`磁盘：${diskAfterBulk.join(' | ')}`);
     await shot(session, '04-批量打标签.png');
 

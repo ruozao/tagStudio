@@ -368,7 +368,8 @@ async function waitServer(ms) {
     eq('给第一个视频打标签 200', tagA.status, 200);
     const nameA = tagA.json.item.name;
     note(`改名结果：${nameA}`);
-    eq('文件名前缀是排好序的三个标签', nameA, `${['助眠', '轻语', '直播录屏'].sort().join('-')}-${videos[0].id}.mp4`);
+    // 标签不再按码点重排：文件名就是输入顺序，第一个是主要特点
+    eq('文件名前缀就是输入顺序的三个标签（第一个是主要特点）', nameA, `${planA.join('-')}-${videos[0].id}.mp4`);
     eq('改名后 uuid 没变', nameA.includes(videos[0].id), true);
 
     const tagB = await api.post(`/api/items/${videos[1].id}/tags`, { tags: planB, mode: 'set' });
