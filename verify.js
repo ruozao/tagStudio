@@ -400,6 +400,78 @@ async function testLibraryScanAndRename() {
   await db.save();
 }
 
+// ------------------------------------------------------------------ 3b. 删除
+
+async function testDeleteItems() {
+  group('3b. 删除素材：先删文件再删记录，库外的文件一个都不碰');
+
+  const dir = await freshDir(path.join(VDIR, 'delete-lib'));
+  await writeFile(path.join(dir, '要删的.mp4'), 'video-1');
+  await writeFile(path.join(dir, '子目录', '也要删.mp3'), 'audio-2');
+  await writeFile(path.join(dir, '留着的.png'), 'image-3');
+  // 库外面放一个文件：如果有人把库里的记录改成 ../外面.txt，删除绝不能被它带着跑
+  await writeFile(path.join(VDIR, '库外面的.txt'), 'outside');
+  const { db, library } = await makeLibrary(dir);
+  await library.scan({ rename: true, prune: true });
+  const items = db.items();
+  eq('扫到 3 个素材', items.length, 3);
+  const [one, two, three] = [
+    items.find((i) => i.name === '要删的.mp4'),
+    items.find((i) => i.name === '也要删.mp3'),
+    items.find((i) => i.name === '留着的.png'),
+  ];
+
+  // 假回收站：前两个真的删掉，第三个「回收站返回码 5（拒绝访问）」
+  const simulated = [];
+  const fakeRecycle = async (files) => {
+    const deleted = [];
+    const failed = [];
+    for (const p of files) {
+      simulated.push(path.basename(p));
+      if (path.basename(p).includes('也要删')) { failed.push({ path: p, error: '回收站返回码 5' }); continue; }
+      await fsp.unlink(p);
+      deleted.push(p);
+    }
+    return { deleted, failed };
+  };
+
+  const del = await library.deleteItems([one.id, two.id], { recycle: fakeRecycle });
+  eq('删掉 1 个、拒了 1 个', `${del.count}/${del.failed.length}`, '1/1');
+  eq('被拒的那条说了原因', del.failed[0] && del.failed[0].reason, '回收站返回码 5');
+  check('第一个文件从磁盘上没了', !fs.existsSync(path.join(dir, '要删的.mp4')));
+  check('被回收站拒绝的文件原封不动', fs.existsSync(path.join(dir, '子目录', '也要删.mp3')));
+  eq('库里只剩 2 条记录', db.items().length, 2);
+  check('被删的那条记录也没了', !db.get(one.id));
+  check('被拒的那条记录还在（文件还在就得留记录）', !!db.get(two.id));
+  eq('返回里写清了删了多少字节', del.bytes, Buffer.byteLength('video-1'));
+  const savedDb = JSON.parse(await fsp.readFile(path.join(dir, util.META_DIRNAME, 'db.json'), 'utf8'));
+  check('删除之后的库已经落盘（不是只在内存里）',
+    !savedDb.items[one.id] && !!savedDb.items[two.id], Object.keys(savedDb.items).length + ' 条');
+
+  // 回收站说删了、文件其实还在（比如被别的程序占着）→ 不能删记录，否则标签凭空消失
+  const liar = async () => ({ deleted: [db.absOf(three)], failed: [] });
+  const lie = await library.deleteItems([three.id], { recycle: liar });
+  eq('文件还在时不认「删除成功」', lie.count, 0);
+  eq('原因写的是文件还在', lie.failed[0] && /文件还在/.test(lie.failed[0].reason), true);
+  check('记录被保住', !!db.get(three.id));
+
+  // 空列表：没有「不给 ids 就删全部」的入口
+  const empty = await library.deleteItems([]);
+  eq('空 ids 直接拒绝', empty.ok, false);
+  eq('空 ids 的返回码是 400', empty.code, 400);
+  const unknown = await library.deleteItems(['f'.repeat(32)], { recycle: fakeRecycle });
+  eq('不存在的 id 进 skipped', unknown.skipped.length, 1);
+  eq('不存在的 id 不会删掉任何东西', unknown.count, undefined);
+
+  // 路径守卫：记录被改成指向库外
+  db.put({ ...db.get(three.id), rel: '../库外面的.txt', name: '库外面的.txt' });
+  const escape = await library.deleteItems([three.id], { recycle: fakeRecycle });
+  eq('指向库外的记录被挡下', escape.count, undefined);
+  eq('挡下的说明是「不在素材目录内」', escape.failed[0] && /不在素材目录内/.test(escape.failed[0].reason), true);
+  check('库外面的文件没被删', fs.existsSync(path.join(VDIR, '库外面的.txt')));
+  await db.save();
+}
+
 // ------------------------------------------------------------------ 4. 崩溃恢复
 
 async function testJournalRecovery() {
@@ -652,6 +724,8 @@ async function testServer() {
     cwd: ROOT,
     stdio: ['ignore', 'ignore', 'ignore'],
     detached: false,
+    // 删除测试不能真往用户的回收站里扔垃圾：unlink 模式下服务端直接删文件。
+    env: { ...process.env, TAGSTUDIO_RECYCLE: 'unlink' },
   });
   let childError = null;
   child.on('error', (err) => { childError = err; });
@@ -961,6 +1035,40 @@ async function testServer() {
       sseText = `超时：${err.message}`;
     }
     check('已结束任务的 SSE 会补发 end 并关闭连接', /event: end/.test(sseText), sseText.slice(0, 120));
+
+    // ---- 删除：必须显式给 ids（没有「不给 ids 就删全部」这种入口），文件走回收站、记录跟着走
+    const delLib = path.join(VDIR, 'http-del');
+    await fsp.mkdir(delLib, { recursive: true });
+    await writeFile(path.join(delLib, '要删的.mp4'), 'delete-me');
+    await writeFile(path.join(delLib, '留着的.mp4'), 'keep-me');
+    const bootDel = await postJson('/api/library/boot', { root: delLib });
+    check('打开删除测试用的库', bootDel.ok === true, bootDel.error);
+    for (let i = 0; i < 100; i += 1) {
+      const s = await (await fetch(`${BASE}/api/state`)).json();
+      if (!s.mounting && !s.scanning) break;
+      await sleep(50);
+    }
+    const delList = await (await fetch(`${BASE}/api/items`)).json();
+    eq('删除测试用的库里有两个素材', delList.items.length, 2);
+    const noIds = await fetch(`${BASE}/api/items/delete`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
+    });
+    eq('不给 ids 的删除请求被拒（400）', noIds.status, 400);
+    const doomed = delList.items.find((i) => i.name === '要删的.mp4') || delList.items[0];
+    const keeper = delList.items.find((i) => i.id !== doomed.id);
+    const delRes = await postJson('/api/items/delete', { ids: [doomed.id] });
+    eq('删掉 1 个', delRes.count, 1);
+    eq('返回里 remaining 跟着减 1', delRes.remaining, 1);
+    check('文件从磁盘上没了', !fs.existsSync(path.join(delLib, doomed.name)), listDisk(delLib).join(' | '));
+    check('没被选中的那个还在', fs.existsSync(path.join(delLib, keeper.name)), listDisk(delLib).join(' | '));
+    const delAfter = await (await fetch(`${BASE}/api/items`)).json();
+    eq('列表跟着少了 1 个', delAfter.items.length, 1);
+    eq('剩下的就是原来没选中的那个', delAfter.items[0].id, keeper.id);
+    eq('返回里还带了最新的统计', delRes.stats && delRes.stats.total, 1);
+    const delTwice = await fetch(`${BASE}/api/items/delete`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: [doomed.id] }),
+    });
+    check('重复删同一个 id 只报错、不 500', delTwice.status === 400 || delTwice.status === 404, String(delTwice.status));
   } finally {
     try { child.kill(); } catch { /* 忽略 */ }
     await sleep(400);
@@ -1503,6 +1611,7 @@ async function main() {
   await testWalk();
   await testTags();
   await testLibraryScanAndRename();
+  await testDeleteItems();
   await testJournalRecovery();
   await testExport();
   await testSuggestions();

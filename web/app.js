@@ -617,6 +617,70 @@ async function afterMutation() {
   await loadItems();
 }
 
+// ------------------------------------------- 删除素材（移到回收站）
+//
+// 「必须先勾选」是硬要求：没有选择时选择条本身是隐藏的，按钮跟着一起消失；
+// 键盘 Delete 也只在这里判断过一次。服务端那边更绝 —— 空 ids 直接 400，
+// 没有任何「不给 ids 就删全部」的入口。
+// 文件不是真的抹掉，而是走 Windows 回收站（lib/recycle.js 的 SHFileOperationW + FOF_ALLOWUNDO）。
+
+function chosenItems() {
+  return S.items.filter((i) => S.selection.has(i.id));
+}
+
+function openDeleteDialog() {
+  if (!S.selection.size) {
+    toast('先勾选要删除的素材', 'warn');
+    return;
+  }
+  const chosen = chosenItems();
+  const bytes = chosen.reduce((n, i) => n + (i.size || 0), 0);
+  $('#delCount').textContent = String(S.selection.size);
+  $('#delBytes').textContent = humanBytes(bytes);
+  const box = $('#delNames');
+  box.textContent = '';
+  // 卡片上显示的是改过的名字，删之前要让人认出是哪个文件，所以优先给原名
+  const names = chosen.map((i) => String(i.origName || i.name)).filter(Boolean);
+  for (const n of names.slice(0, 8)) box.append(el('div', 'del-name', n));
+  if (names.length > 8) box.append(el('div', 'del-name', `…还有 ${names.length - 8} 个`));
+  const go = $('#delGo');
+  go.disabled = false;
+  go.textContent = '移到回收站';
+  $('#delDlg').showModal();
+}
+
+async function deleteSelected() {
+  const dlg = $('#delDlg');
+  const go = $('#delGo');
+  const ids = [...S.selection];
+  if (!ids.length) { dlg.close(); return; }
+  const label = go.textContent;
+  go.disabled = true;
+  go.textContent = '正在移到回收站…';
+  try {
+    const res = await api('/api/items/delete', { method: 'POST', body: { ids } });
+    const n = Number(res.count) || 0;
+    const bad = res.failed || [];
+    dlg.close();
+    for (const d of res.deleted || []) S.selection.delete(d.id);
+    await afterMutation();
+    if (n && !bad.length) {
+      toast(`已把 ${n} 个素材移到回收站（${humanBytes(res.bytes || 0)}，可在资源管理器里还原）`, 'ok');
+    } else if (n && bad.length) {
+      const first = bad.slice(0, 2).map((f) => `${f.name}（${f.reason}）`).join('、');
+      toast(`移走 ${n} 个，${bad.length} 个没成功：${first}`, 'warn');
+    } else {
+      toast(bad.length ? `没删成：${bad[0].name} —— ${bad[0].reason}` : '没有素材被删除', 'err');
+    }
+  } catch (err) {
+    dlg.close();
+    toast(`删除失败：${err.message}`, 'err');
+  } finally {
+    go.disabled = false;
+    go.textContent = label;
+  }
+}
+
 // ------------------------------------------- 从文件名认出旧标签（「tag1-tag2.mp4」）
 //
 // 以前用本工具打过标签、或从别的设备按同样规则命名过的素材，文件名里就带着标签。
@@ -1415,6 +1479,10 @@ function bindEvents() {
   $('#bulkAdd').onclick = () => bulk('add', 'add', $('#bulkTags').value);
   $('#bulkRemoveBtn').onclick = () => bulk('remove', 'remove', $('#bulkRemove').value);
   $('#selExport').onclick = () => { exportScope = { mode: 'selected' }; openExport(); };
+  // 删除：只能删勾上的，按钮本身跟着选择条一起出现/消失
+  $('#selDelete').onclick = () => openDeleteDialog();
+  $('#delCancel').onclick = () => $('#delDlg').close();
+  $('#delGo').onclick = () => deleteSelected();
 
   // 编辑器
   $('#editorSave').onclick = saveEditor;
@@ -1495,6 +1563,11 @@ function bindEvents() {
       $('#selectAllBtn').click();
     }
     if (ev.key === 'f' && !typing && !ev.ctrlKey && !ev.metaKey) { $('#search').focus(); }
+    // Delete 键删勾选的素材。输入框里按 Delete 是删字符，不能拦。
+    if (ev.key === 'Delete' && !typing && !document.querySelector('dialog[open]') && S.selection.size) {
+      ev.preventDefault();
+      openDeleteDialog();
+    }
   });
 }
 

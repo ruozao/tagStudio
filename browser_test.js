@@ -194,6 +194,8 @@ async function main() {
   const appLogFd = fs.openSync(appLog, 'a');
   const app = spawn(process.execPath, ['server.js', '--root', LIBDIR, '--port', String(PORT), '--no-open', '--scan-interval', '0'], {
     cwd: ROOT, stdio: ['ignore', appLogFd, appLogFd],
+    // 删除测试不能真把文件扔进你的回收站：unlink 模式下服务端直接删。
+    env: { ...process.env, TAGSTUDIO_RECYCLE: 'unlink' },
   });
   app.on('error', (err) => console.log(`   服务起不来：${err.message}`));
 
@@ -629,6 +631,65 @@ async function main() {
       await evaluate(session, `document.querySelectorAll('#grid .card').length`));
     note(`切回来后：${await evaluate(session, `document.querySelector('#rootPath').textContent.trim()`)}`);
     await shot(session, '07-顶栏快速切换素材文件夹.png');
+
+    // ---------------------------------------------------------- 6b. 删除
+    section('6b. 删除选中的素材（必须先选中才给删）');
+
+    eq('没勾选时选择栏是收起的 —— 也就没有删除入口',
+      await evaluate(session, `getComputedStyle(document.querySelector('#selbar')).display`), 'none');
+
+    await evaluate(session, `document.querySelectorAll('#grid .card .check')[0].click()`);
+    const delBar = await until(async () => await evaluate(session, `(() => {
+      const b = document.querySelector('#selDelete');
+      return Boolean(b) && getComputedStyle(document.querySelector('#selbar')).display !== 'none';
+    })()`), 8000);
+    check('勾选一个素材后，选择栏里出现「删除选中」', delBar === true);
+    eq('按钮上写的是「删除选中」', await evaluate(session, `document.querySelector('#selDelete').textContent.trim()`), '删除选中');
+    check('按钮提示写明是移到回收站（可以还原）',
+      await evaluate(session, `document.querySelector('#selDelete').title.includes('回收站')`), true);
+
+    await evaluate(session, `document.querySelector('#selDelete').click()`);
+    const dlgOpen = await until(async () => await evaluate(session, `document.querySelector('#delDlg').open === true`), 8000);
+    check('点「删除选中」先弹确认框（不是点一下就没了）', dlgOpen === true);
+    eq('确认框里写着要删几个', await evaluate(session, `document.querySelector('#delCount').textContent.trim()`), '1');
+    const delNameText = await evaluate(session, `document.querySelector('#delNames').textContent.trim()`);
+    check('确认框里列出了要删的文件原名', delNameText.length > 0, delNameText);
+    note(`确认框内容：${delNameText.replace(/\s+/g, ' ')}`);
+
+    await evaluate(session, `document.querySelector('#delCancel').click()`);
+    await sleep(400);
+    eq('点「先不删」后弹窗关掉', await evaluate(session, `document.querySelector('#delDlg').open`), false);
+    eq('取消之后卡片还是 3 张', await evaluate(session, `document.querySelectorAll('#grid .card').length`), 3);
+    const diskBeforeDel = (await fsp.readdir(LIBDIR)).filter((n) => /\.(mp3|mp4|png|jpg|jpeg|webp)$/i.test(n));
+    eq('取消之后磁盘上还是 3 个媒体文件', diskBeforeDel.length, 3);
+
+    // 键盘 Delete 也能用，但前提是真的有选中（没选中时按了什么都不该发生）
+    await evaluate(session, `document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }))`);
+    const keyOpen = await until(async () => await evaluate(session, `document.querySelector('#delDlg').open === true`), 5000);
+    check('选中状态下按 Delete 键也会弹确认框', keyOpen === true);
+    await evaluate(session, `document.querySelector('#delCancel').click()`);
+    await sleep(300);
+
+    // 真删一次
+    await evaluate(session, `document.querySelector('#selDelete').click()`);
+    await until(async () => await evaluate(session, `document.querySelector('#delDlg').open === true`), 8000);
+    await shot(session, '08-删除确认.png');
+    await evaluate(session, `document.querySelector('#delGo').click()`);
+    const gone = await until(async () => (await evaluate(session, `document.querySelectorAll('#grid .card').length`)) === 2, 25000);
+    check('确认之后列表里少了一张卡', gone === true,
+      await evaluate(session, `document.querySelectorAll('#grid .card').length`));
+    const diskAfterDel = (await fsp.readdir(LIBDIR)).filter((n) => /\.(mp3|mp4|png|jpg|jpeg|webp)$/i.test(n));
+    eq('磁盘上也真的少了那个文件', diskAfterDel.length, 2);
+    note(`删完磁盘：${diskAfterDel.join(' | ')}`);
+    const stDel = await httpJson(`${BASE}/api/state`);
+    eq('库里的统计跟着变了', stDel.stats.total, 2);
+    check('删完之后选择栏自动收起（不会留着旧勾选再删一次）',
+      await evaluate(session, `getComputedStyle(document.querySelector('#selbar')).display`) === 'none',
+      await evaluate(session, `document.querySelector('#selbar').textContent.replace(/\\s+/g,' ').trim()`));
+    const delToast = await evaluate(session, `document.querySelector('#toast').textContent.trim()`);
+    check('给了「删掉了几个、去哪了」的提示', /回收站|已删除/.test(delToast), delToast);
+    note(`删除提示：${delToast.replace(/\s+/g, ' ')}`);
+    await shot(session, '09-删除完成.png');
 
     // ---------------------------------------------------------- 7. 无报错
     section('7. 运行期有没有报错');

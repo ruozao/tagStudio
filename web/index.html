@@ -113,6 +113,7 @@
     <input id="bulkRemove" type="text" placeholder="批量移除标签" spellcheck="false" />
     <button id="bulkRemoveBtn" class="btn tiny">批量移除</button>
     <button id="selExport" class="btn tiny">导出选中</button>
+    <button id="selDelete" class="btn tiny danger" title="移到 Windows 回收站（可在资源管理器里还原）">删除选中</button>
     <button id="selClear" class="btn tiny ghost">取消选择</button>
   </div>
 </section>
@@ -235,6 +236,24 @@
       <button id="sugIgnore" class="btn ghost" type="button">都先不用</button>
       <button id="sugClose" class="btn ghost" type="button">关闭</button>
       <button id="sugAccept" class="btn primary" type="button">采纳勾选的</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- 删除素材前的确认（必须先勾选；文件进回收站，可还原） -->
+<dialog id="delDlg" class="dialog">
+  <div class="dialog-body">
+    <h3>把这些素材移到回收站？</h3>
+    <p class="del-lead">
+      将从库里和磁盘上移除 <b id="delCount">0</b> 个素材（<span id="delBytes" class="muted"></span>）：
+    </p>
+    <div id="delNames" class="del-names"></div>
+    <p class="del-warn">
+      文件会移到 <b>Windows 回收站</b>，需要时可以在资源管理器里还原；库里的标签记录会一起删掉。
+    </p>
+    <div class="dialog-actions">
+      <button id="delCancel" class="btn ghost" type="button">取消</button>
+      <button id="delGo" class="btn danger" type="button">移到回收站</button>
     </div>
   </div>
 </dialog>

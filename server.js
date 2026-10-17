@@ -81,6 +81,12 @@ const state = {
   /** 后台核对素材中（打开库不再等扫描，扫完这里变回 false） */
   scanning: false,
   lastScanError: null,
+  /**
+   * 删除素材时怎么处理磁盘上的文件：null = 默认（送进 Windows 回收站）。
+   * 只有环境变量 TAGSTUDIO_RECYCLE=unlink 时才会换成「直接删」，那是给自动化测试用的 ——
+   * 测试会在临时库里反复删素材，真往回收站扔等于往用户的回收站里倒垃圾。
+   */
+  recycle: null,
 };
 
 /**
@@ -94,6 +100,27 @@ function exclusive(fn) {
   const run = writeQueue.then(() => fn());
   writeQueue = run.catch(() => {});
   return run;
+}
+
+/**
+ * 测试专用的「删除器」：直接 unlink，不进回收站。
+ * 默认返回 null，也就是走 lib/recycle.js 的真回收站实现。
+ */
+function unlinkRecycler() {
+  if (String(process.env.TAGSTUDIO_RECYCLE || '').toLowerCase() !== 'unlink') return null;
+  return async (files) => {
+    const deleted = [];
+    const failed = [];
+    for (const abs of files || []) {
+      try {
+        await fsp.unlink(abs);
+        deleted.push(abs);
+      } catch (err) {
+        failed.push({ path: abs, error: String((err && err.message) || err) });
+      }
+    }
+    return { deleted, failed };
+  };
 }
 
 async function loadConfig() {
@@ -569,6 +596,26 @@ route('POST', /^\/api\/items\/([0-9a-fA-F]{32})\/preview$/, async (req, _url, id
   return { ok: true, preview: state.library.preview(item, v.tags), tags: v.tags };
 });
 
+// 删除选中的素材：移到 Windows 回收站（可在资源管理器里还原），并删掉库里的记录。
+// 必须显式给 ids —— 没有「不给 ids 就删全部」这种用法，服务端也不认空列表。
+route('POST', /^\/api\/items\/delete$/, async (req) => {
+  requireLibrary();
+  const body = await readBody(req);
+  const ids = Array.isArray(body.ids) ? body.ids.map(String).filter(Boolean) : [];
+  if (!ids.length) throw new ApiError(400, '没有选中任何素材');
+  const res = await exclusive(() => state.library.deleteItems(ids, state.recycle ? { recycle: state.recycle } : {}));
+  if (!res.ok) {
+    throw new ApiError(res.code || 400, res.reason, {
+      deleted: res.deleted || [],
+      failed: res.failed || [],
+      skipped: res.skipped || [],
+      remaining: res.remaining,
+    });
+  }
+  if (state.thumbs) await state.thumbs.forget((res.deleted || []).map((d) => d.id));
+  return { ...res, stats: state.db.stats(), tags: state.db.tagList() };
+});
+
 route('POST', /^\/api\/items\/bulk$/, async (req) => {
   requireLibrary();
   const body = await readBody(req);
@@ -1027,6 +1074,8 @@ async function main() {
   state.scanInterval = args.scanInterval != null ? args.scanInterval : 45000;
   // 封面并发：命令行 > config.json > 默认 4。0 / 负数 / 乱填都会退回默认值（见 clampActive）。
   state.thumbConcurrency = clampActive(args.thumbConcurrency != null ? args.thumbConcurrency : state.config.thumbConcurrency);
+  // 删除素材走回收站；测试用 TAGSTUDIO_RECYCLE=unlink 换成直接删（见 unlinkRecycler）。
+  state.recycle = unlinkRecycler();
   const port = args.port || state.config.port || DEFAULT_PORT;
 
   // 先 listen 再打开库：打开一个几万条的库要读元数据 + 核对磁盘，这段时间端口一直没起来，
