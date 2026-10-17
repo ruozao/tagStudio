@@ -271,6 +271,7 @@ function scheduleScan() {
 // ------------------------------------------------------------------ HTTP 小工具
 
 function sendJson(res, status, value) {
+  if (clientGone(null, res)) return false;
   const body = JSON.stringify(value);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -278,10 +279,11 @@ function sendJson(res, status, value) {
     'Content-Length': Buffer.byteLength(body),
   });
   res.end(body);
+  return true;
 }
 
 function sendError(res, status, message, extra) {
-  sendJson(res, status, { ok: false, error: message, ...(extra || {}) });
+  return sendJson(res, status, { ok: false, error: message, ...(extra || {}) });
 }
 
 /** 从 req.url 取 query。分发时第二参数留给 res，所以处理器要自己解析查询串。 */
@@ -316,6 +318,7 @@ function inferTagMode(body) {
 
 function staticFile(res, absPath, opts = {}) {
   return fsp.stat(absPath).then((st) => {
+    if (clientGone(null, res)) return undefined;
     if (!st.isFile()) {
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('404');
@@ -326,20 +329,68 @@ function staticFile(res, absPath, opts = {}) {
       'Content-Length': st.size,
       'Cache-Control': opts.cache || 'no-cache',
     });
-    pipeline(fs.createReadStream(absPath), res, () => {});
+    pipeToResponse(null, res, fs.createReadStream(absPath));
     return undefined;
   }).catch(() => {
+    if (clientGone(null, res)) return;
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('404');
   });
 }
 
+/** 客户端已经走了（刷新/关页/换图源/拖进度条），这时候再往响应里写只会抛错。 */
+function clientGone(req, res) {
+  return Boolean((req && (req.destroyed || req.aborted)) || (res && (res.destroyed || res.writableEnded)));
+}
+
+/** 这些错误都是"对面没了"，不是服务端出错，不该记成 500。 */
+function isAbortError(err, req, res) {
+  const code = (err && err.code) || '';
+  if (code === 'ERR_STREAM_UNABLE_TO_PIPE' || code === 'ERR_STREAM_PREMATURE_CLOSE'
+    || code === 'ECONNRESET' || code === 'EPIPE' || code === 'ERR_CANCELED') return true;
+  // 注意：这里只看响应，不看 req.destroyed —— 请求体读完之后 req 的流本来就被拆了，
+  // 拿它当"客户端走了"会把正常的 400/404 也吞掉（实测就是这么把 400 变成 ECONNRESET 的）。
+  return Boolean(res && (res.destroyed || res.writableEnded));
+}
+
+/**
+ * 把读流接到响应上。
+ * 为什么不能直接 `pipeline(rs, res, cb)`：
+ *   1. 浏览器取消请求后 res 已经是 destroyed，pipeline 会**同步抛出**
+ *      `ERR_STREAM_UNABLE_TO_PIPE: Cannot pipe to a closed or destroyed stream`
+ *      （缩略图重试换 src、卡片被重画、拖进度条都会触发）；
+ *   2. 那个错误落到路由的 catch 里会被当成 500 打印一屏堆栈，然后还要往一个
+ *      已经没了的响应里写 500 JSON。
+ * 所以这里先看两边还活着不，再接；接的过程失败也只按"对面走了"处理。
+ */
+function pipeToResponse(req, res, rs) {
+  const cleanup = () => { if (!rs.destroyed) rs.destroy(); };
+  if (req) req.once('aborted', cleanup);
+  res.once('close', cleanup);
+  const done = (err) => {
+    if (req) req.removeListener('aborted', cleanup);
+    res.removeListener('close', cleanup);
+    if (err && !isAbortError(err, req, res)) {
+      process.stderr.write(`[file] 传输中断 ${rs.path || ''} ${err.code || ''} ${err.message}\n`);
+    }
+  };
+  try {
+    pipeline(rs, res, done);
+  } catch (err) {
+    // 同步抛出的那种：说明 res 在我们准备接的时候就已经关了
+    cleanup();
+    done(err);
+  }
+}
+
 /** 带 Range 的文件流：<video> 的 seek 依赖 206 与 Content-Range。 */
 function streamFile(req, res, absPath, opts = {}) {
+  if (clientGone(req, res)) return;                     // 还没开始，对面就走了
   let fd;
   try {
     fd = fs.openSync(absPath, 'r');
   } catch (err) {
+    if (clientGone(req, res)) return;
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end(`404 ${err && err.code}`);
     return;
@@ -362,7 +413,7 @@ function streamFile(req, res, absPath, opts = {}) {
       return;
     }
     // pipeline 而不是 pipe：客户端中途断开（拖进度条时很常见）也会销毁读流、关掉 fd
-    pipeline(fs.createReadStream(null, { fd, autoClose: true }), res, () => {});
+    pipeToResponse(req, res, fs.createReadStream(null, { fd, autoClose: true }));
     return;
   }
 
@@ -404,7 +455,7 @@ function streamFile(req, res, absPath, opts = {}) {
     res.end();
     return;
   }
-  pipeline(fs.createReadStream(null, { fd, start, end, autoClose: true }), res, () => {});
+  pipeToResponse(req, res, fs.createReadStream(null, { fd, start, end, autoClose: true }));
 }
 
 // ------------------------------------------------------------------ 路由
@@ -746,6 +797,9 @@ route('GET', /^\/api\/thumb\/([0-9a-fA-F]{32})$/, async (req, res, id) => {
     waitMs: THUMB_WAIT_MS,
     priority: queryOf(req).get('p') === '1',
   });
+  // 等这一步的 1.2 秒里，浏览器可能早就换图源/滚走了（前端重试就是这么干的）。
+  // 不加这个判断，后面 res.end() 会往一个已经销毁的流里写。
+  if (clientGone(req, res)) return undefined;
   if (result.pending) {
     res.writeHead(200, {
       'Content-Type': 'image/png',
@@ -1084,11 +1138,17 @@ const server = http.createServer(async (req, res) => {
     }
     sendJson(res, 200, result);
   } catch (err) {
+    // 客户端自己走了（缩略图重试换 src、卡片被重画、刷新/关页、拖进度条）：
+    // 这不是服务端的错，不该记 500，更不该再往一个已经不存在的响应里写东西。
+    if (isAbortError(err, req, res)) {
+      if (!res.destroyed) res.destroy();
+      return;
+    }
     const status = err instanceof ApiError ? err.status : 500;
     const message = String((err && err.message) || err);
     if (status >= 500) process.stderr.write(`[api] ${req.method} ${pathname} → ${status} ${message}\n${err && err.stack}\n`);
     if (!res.headersSent) sendError(res, status, message, err instanceof ApiError ? err.extra : undefined);
-    else res.end();
+    else if (!clientGone(req, res)) res.end();
   } finally {
     const ms = Date.now() - started;
     if (ms > 1500) process.stdout.write(`[slow] ${req.method} ${pathname} ${ms}ms\n`);

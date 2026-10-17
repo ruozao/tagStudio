@@ -50,6 +50,34 @@
 `verify.js` 373 → 414 项（等待上限、优先队列、排队满了不入队、超时不再退档、后台抽完再来问），
 `e2e_real.js` 83 → 85 项（每次请求必须 1.5 秒内返回）。
 
+### 客户端取消请求不再记成 500
+
+改完占位图之后，服务端日志里会出现：
+
+```
+[api] GET /api/thumb/67a0… → 500 Cannot pipe to a closed or destroyed stream
+Error [ERR_STREAM_UNABLE_TO_PIPE]: Cannot pipe to a closed or destroyed stream
+```
+
+这不是真的有错。前端给缩略图重试时会换 `img.src`，用户滚走/刷新/拖进度条也一样 ——
+浏览器会主动掐断上一个请求，此时 `res` 已经 `destroyed`，而 `streamFile` 直接
+`pipeline(读流, res)` 会**同步抛出** ERR_STREAM_UNABLE_TO_PIPE，落到路由的 catch 里就变成一条
+500 日志，还试图往一个已经不存在的响应里写 500 JSON。
+
+- `pipeToResponse()` 取代三处裸 `pipeline`：接之前先看两边还活着不，接的过程中出错只按
+  "对面走了"处理，`req`/`res` 的 `close` 事件也会主动销毁读流（不泄漏 fd）。
+- `sendJson()` / `sendError()` / `staticFile()` 写之前先看响应还在不在。
+- 路由的 catch 里认四种"对面没了"的错误码（`ERR_STREAM_UNABLE_TO_PIPE`、
+  `ERR_STREAM_PREMATURE_CLOSE`、`ECONNRESET`、`EPIPE`）：直接收工，不记 500、不写响应。
+  **坑**：判断"客户端走了"只能看 `res`，不能看 `req.destroyed` —— 请求体读完之后 req 的流本来
+  就被拆了，用它判断会把正常的 400 也吞掉（实测就是这么把「非法标签 → 400」变成连接被重置的）。
+- 顺带让 `verify.js` 把服务端 stderr 接到自己的 stderr 上：以前 spawn 时 `'ignore'`，
+  出问题只能看到一句 `fetch failed`，服务端到底报了什么完全看不见。
+
+验证：`verify.js` 414 → 417（中途掐断媒体流后服务端还活着、接口照常返回）；
+另外在真实的 `F:\video` 上掐了 40 条缩略图请求（`node .dbg-bench/abortprobe.js`），
+服务端 stderr **一条 500 都没有**，`/api/state` 照常 200。
+
 ### 删除选中的素材
 
 勾选素材之后，底部选择栏多了「**删除选中**」（也可以按 `Delete` 键）。点了先弹确认框，写清楚要删几个、占多少、前几个文件的原始名字；确认之后文件进 Windows 回收站、记录从库里拿掉。

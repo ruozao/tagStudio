@@ -17,6 +17,7 @@ const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
 const zlib = require('zlib');
+const http = require('http');
 const { spawn, spawnSync } = require('child_process');
 
 const util = require('./lib/util');
@@ -722,11 +723,13 @@ async function testServer() {
   const logPath = path.join(VDIR, 'server.log');
   const child = spawn(process.execPath, ['server.js', '--root', serverLib, '--port', String(APP_PORT), '--no-open', '--scan-interval', '0'], {
     cwd: ROOT,
-    stdio: ['ignore', 'ignore', 'ignore'],
+    stdio: ['ignore', 'ignore', 'pipe'],
     detached: false,
     // 删除测试不能真往用户的回收站里扔垃圾：unlink 模式下服务端直接删文件。
     env: { ...process.env, TAGSTUDIO_RECYCLE: 'unlink' },
   });
+  // 服务端 stderr 原来直接丢掉，出问题时只能看到 "fetch failed"。改成打到本进程的 stderr。
+  child.stderr.on('data', (chunk) => { process.stderr.write(`[server] ${chunk}`); });
   let childError = null;
   child.on('error', (err) => { childError = err; });
 
@@ -895,6 +898,27 @@ async function testServer() {
 
     const dl = await httpGet(`/api/media/${vid.id}?dl=1`);
     check('下载模式带 Content-Disposition（含 UTF-8 文件名）', /filename\*=UTF-8''/.test(dl.headers.get('content-disposition') || ''), dl.headers.get('content-disposition'));
+
+    // 客户端中途断开不能把服务端搞崩、也不能记成 500。
+    // 现场：前端给缩略图重试换 src、或者用户拖进度条/刷新时，res 已经 destroy，
+    // 老代码里 pipeline 会**同步抛出** ERR_STREAM_UNABLE_TO_PIPE，落到路由的 catch 里
+    // 变成一条 500 日志，还试图往已经不存在的响应里写 500 JSON。
+    const aborted = await new Promise((resolve) => {
+      const r = http.request(`${BASE}/api/media/${vid.id}`, { method: 'GET' }, (resp) => {
+        resp.once('data', () => {
+          r.destroy();                       // 收到第一块就掐断，模拟浏览器取消
+          resolve({ ok: true, status: resp.statusCode });
+        });
+      });
+      r.on('error', (err) => resolve({ ok: false, error: err.code }));
+      r.end();
+    });
+    check('中途掐断的媒体请求不会在本端抛错', aborted.ok || aborted.error === 'ECONNRESET', JSON.stringify(aborted));
+    await sleep(250);
+    const afterAbort = await fetch(`${BASE}/api/state`);
+    eq('掐断之后服务端还活着', afterAbort.status, 200);
+    const afterAbortList = await (await fetch(`${BASE}/api/items?limit=5`)).json();
+    eq('掐断之后接口照常返回', afterAbortList.items.length > 0, true);
 
     // 缩略图：有 ffmpeg 且文件真是视频 → 200 出图；否则应是 404（"没有缩略图"）而不是 500。
     // 这里的假视频是 4096 字节的填充数据，就算有 ffmpeg 也抽不出帧，所以两种都算通过。
