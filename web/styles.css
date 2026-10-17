@@ -220,7 +220,13 @@ button.path:focus-visible { outline: 2px solid var(--accent); outline-offset: 2p
   position: relative; aspect-ratio: 16/10; background: #0a0c10;
   display: flex; align-items: center; justify-content: center; overflow: hidden;
 }
-.card .thumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.card .thumb img { width: 100%; height: 100%; object-fit: contain; display: block; background: #0a0c10; }
+/* 抽帧要一两百毫秒（冷盘上更久），图没到之前先压一层很淡的底色，
+   到位后淡入 —— 避免卡片一块块"啪"地跳出来。prefers-reduced-motion 时不淡入。 */
+.card .thumb img[data-loading] { background: #14171d; }
+.card .thumb img.loaded { animation: thumbIn 160ms ease-out; }
+@keyframes thumbIn { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .card .thumb img.loaded { animation: none; } }
 .card .thumb .ph { font-size: 34px; color: var(--fg3); }
 .card .thumb .badge {
   position: absolute; left: 6px; top: 6px; font-size: 11px;

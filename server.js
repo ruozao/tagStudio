@@ -24,7 +24,7 @@ const util = require('./lib/util');
 const { Database } = require('./lib/db');
 const { Journal } = require('./lib/journal');
 const { Library } = require('./lib/library');
-const { Thumbnails } = require('./lib/thumbnails');
+const { Thumbnails, DEFAULT_MAX_ACTIVE, clampActive } = require('./lib/thumbnails');
 const { Exports } = require('./lib/exporter');
 const tagsMod = require('./lib/tags');
 const naming = require('./lib/naming');
@@ -40,7 +40,7 @@ const DEFAULT_PORT = 8787;
 // ------------------------------------------------------------------ 命令行
 
 function parseArgs(argv) {
-  const out = { root: null, port: null, open: true, scanInterval: 45000 };
+  const out = { root: null, port: null, open: true, scanInterval: 45000, thumbConcurrency: null };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--root' || a === '-r') out.root = argv[++i];
@@ -49,8 +49,10 @@ function parseArgs(argv) {
     else if (a.startsWith('--port=')) out.port = Number(a.slice(7));
     else if (a === '--no-open') out.open = false;
     else if (a === '--scan-interval') out.scanInterval = Number(argv[++i]) || 0;
+    else if (a === '--thumb-concurrency') out.thumbConcurrency = Number(argv[++i]);
+    else if (a.startsWith('--thumb-concurrency=')) out.thumbConcurrency = Number(a.slice(20));
     else if (a === '--help' || a === '-h') {
-      process.stdout.write(`tagStudio — 本地媒体标签管理\n\n  node server.js [--root <素材目录>] [--port 8787] [--no-open]\n\n`);
+      process.stdout.write(`tagStudio — 本地媒体标签管理\n\n  node server.js [--root <素材目录>] [--port 8787] [--no-open]\n    [--scan-interval 45000] [--thumb-concurrency 4]\n\n`);
       process.exit(0);
     }
   }
@@ -72,6 +74,8 @@ const state = {
   lastScan: null,
   scanTimer: null,
   scanInterval: 45000,
+  /** 同时跑几个 ffmpeg 抽封面（默认 4，--thumb-concurrency 可改） */
+  thumbConcurrency: DEFAULT_MAX_ACTIVE,
   /** 正在打开的库路径（mount 进行中，前端据此显示「正在打开…」而不是让用户重选文件夹） */
   mounting: null,
   /** 后台核对素材中（打开库不再等扫描，扫完这里变回 false） */
@@ -157,7 +161,7 @@ async function openLibrary(absRoot, opts = {}) {
   const journal = new Journal(metaRoot);
   await journal.init();
   const library = new Library({ root: absRoot, db, journal });
-  const thumbs = new Thumbnails({ metaRoot, rootOf: () => state.root, dbOf: () => state.db });
+  const thumbs = new Thumbnails({ metaRoot, rootOf: () => state.root, dbOf: () => state.db, maxActive: state.thumbConcurrency });
   await thumbs.init();
   const exports = new Exports({ metaRoot, rootOf: () => state.root, dbOf: () => state.db });
   await exports.init();
@@ -429,6 +433,7 @@ route('GET', /^\/api\/state$/, async () => {
       maxAbsPathChars: util.MAX_ABS_PATH_CHARS,
     },
     scanInterval: state.scanInterval,
+    thumbConcurrency: state.thumbs ? state.thumbs.maxActive : state.thumbConcurrency,
     lastScan: state.lastScan ? { scannedAt: state.lastScan.scannedAt, added: state.lastScan.added, removed: state.lastScan.removed, renamed: state.lastScan.renamed } : null,
     stats: state.ready ? state.db.stats() : null,
   };
@@ -685,7 +690,13 @@ route('GET', /^\/api\/thumb\/([0-9a-fA-F]{32})$/, async (req, res, id) => {
     // 上仍然吐 500（三元 + || 混用被解析成了别的意思），显式 if 更稳也更好读。
     let code = 404;
     if (result.code && result.code >= 400 && result.code < 500) code = result.code;
-    res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8' });
+    // 404 也允许浏览器缓存一小会儿：一个库里没有封面/抽不出图的素材可能几千条，
+    // 每次翻页都来问一遍，服务端虽然记得「这个文件失败了」但也白白多几千次请求。
+    // 5 分钟后失效 —— 用户装上 ffmpeg 之后不用清缓存也能看到封面。
+    res.writeHead(code, {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'private, max-age=300',
+    });
     res.end(result.reason || 'no thumbnail');
     return undefined;
   }
@@ -1014,6 +1025,8 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   await loadConfig();
   state.scanInterval = args.scanInterval != null ? args.scanInterval : 45000;
+  // 封面并发：命令行 > config.json > 默认 4。0 / 负数 / 乱填都会退回默认值（见 clampActive）。
+  state.thumbConcurrency = clampActive(args.thumbConcurrency != null ? args.thumbConcurrency : state.config.thumbConcurrency);
   const port = args.port || state.config.port || DEFAULT_PORT;
 
   // 先 listen 再打开库：打开一个几万条的库要读元数据 + 核对磁盘，这段时间端口一直没起来，

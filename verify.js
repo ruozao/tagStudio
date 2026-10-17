@@ -751,6 +751,10 @@ async function testServer() {
     const list = await (await fetch(`${BASE}/api/items`)).json();
     eq('列表接口返回 2 个素材', list.items.length, 2);
     check('每项都带了缩略图/播放/下载地址', list.items.every((i) => i.thumbUrl && i.url && i.downloadUrl && i.sizeText && i.kindLabel));
+    // 缩略图地址带 mtime 版本号：/api/thumb 的响应缓存一天，源文件改了（mtime 变）URL 就必须变，
+    // 否则浏览器一直用旧封面，用户会以为"我换了这个视频的封面怎么没变"。
+    check('缩略图地址带版本号 ?v=<mtime>',
+      list.items.every((i) => /^\/api\/thumb\/[0-9a-f]{32}\?v=\d+$/.test(i.thumbUrl)), JSON.stringify(list.items.map((i) => i.thumbUrl)));
     // 界面三处（卡片 / 标签编辑器 / 批量面板）都要靠这两个字段把"这原本是哪个文件"显示出来
     check('每项都带了入库时的原始文件名 origName',
       list.items.every((i) => typeof i.origName === 'string' && i.origName.length > 0), JSON.stringify(list.items.map((i) => i.origName)));
@@ -1339,6 +1343,42 @@ async function testRegressions() {
   check('没有 ffmpeg 时大图退回原图', bigNoFf.ok && bigNoFf.source.endsWith('大图.jpg'), JSON.stringify(bigNoFf));
   const heicNoFf = await noFf.ensure(byName('手机.heic').id);
   eq('没有 ffmpeg 时 HEIC 报没有缩略图（浏览器显示不了原图）', heicNoFf.code, 404);
+
+  // 并发上限：默认 4 路，乱填退回默认、超范围夹到 8，运行期可改；真并行、但不超上限。
+  // （一屏几十个格子同时要封面时，2 路是瓶颈：实测单张 ~150ms，4 路比 2 路快一倍多。）
+  eq('缩略图默认并发 4 路', thumbs.maxActive, 4);
+  const mkThumbs = (extra) => new Thumbnails({ metaRoot: path.join(thumbLib, util.META_DIRNAME), rootOf: () => thumbLib, dbOf: () => T.db, ...extra });
+  eq('并发数乱填（0）退回默认 4', mkThumbs({ maxActive: 0 }).maxActive, 4);
+  eq('并发数乱填（"abc"）退回默认 4', mkThumbs({ maxActive: 'abc' }).maxActive, 4);
+  eq('并发数太大夹到 8', mkThumbs({ maxActive: 99 }).maxActive, 8);
+  eq('并发数运行期能改', thumbs.setMaxActive(2), 2);
+  eq('改回 4 路', thumbs.setMaxActive(4), 4);
+
+  for (let i = 1; i <= 6; i += 1) await writeFile(path.join(thumbLib, `并发${i}.mp4`), 'v');
+  await T.library.scan({ rename: true, prune: true });
+  const concIds = T.db.items().filter((i) => /^并发\d\.mp4$/.test(i.name)).map((i) => i.id);
+  eq('准备了 6 个待抽帧的视频', concIds.length, 6);
+  let live = 0;
+  let peak = 0;
+  const realRun = thumbs.run;
+  thumbs.run = async (_bin, args) => {
+    live += 1;
+    peak = Math.max(peak, live);
+    await new Promise((r) => setTimeout(r, 40));
+    fs.writeFileSync(args[args.length - 1], Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+    live -= 1;
+    return true;
+  };
+  try {
+    await Promise.all(concIds.map((id) => thumbs.ensure(id)));
+  } finally {
+    thumbs.run = realRun;
+  }
+  check('同时要 6 张封面时真的并行了（峰值 > 1）', peak > 1, `峰值 ${peak}`);
+  check('并行数不超过上限（峰值 ≤ 4）', peak <= 4, `峰值 ${peak}`);
+
+  const viewThumb = T.library.itemView(T.db.items().find((i) => i.name === '大图.jpg'));
+  check('itemView 的缩略图地址带 mtime 版本号', /^\/api\/thumb\/[0-9a-f]{32}\?v=\d+$/.test(viewThumb.thumbUrl), viewThumb.thumbUrl);
 
   // zip：普通 + 强制 ZIP64，都交给 .NET 的 ZipFile 独立解开校验
   if (process.platform !== 'win32') {

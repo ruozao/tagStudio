@@ -276,7 +276,8 @@
 
 **Q：端口被占 / 不想自动开浏览器？**
 `node server.js --port 9000 --no-open`。其它参数：`--root <路径>` 直接指定库、
-`--scan-interval 0` 关掉自动扫描（默认每 45 秒一次）。
+`--scan-interval 0` 关掉自动扫描（默认每 45 秒一次）、
+`--thumb-concurrency 4` 同时抽几张封面（默认 4，可填 1–8；机器较弱时可以调成 2）。
 
 **Q：`start.cmd` 双击没反应 / 报一堆乱码？**
 直接在该目录开命令行跑 `node server.js`（效果完全一样）。

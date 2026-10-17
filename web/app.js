@@ -489,7 +489,13 @@ function renderCard(item) {
   } else {
     const img = el('img');
     img.loading = 'lazy';
+    img.decoding = 'async';
     img.alt = item.name;
+    img.dataset.loading = '1';
+    img.onload = () => {
+      delete img.dataset.loading;
+      img.classList.add('loaded');
+    };
     img.src = item.thumbUrl;
     img.onerror = () => {
       img.remove();
