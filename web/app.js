@@ -24,6 +24,8 @@ function humanBytes(n) {
   return `${i === 0 ? n : n.toFixed(n < 10 ? 2 : 1)} ${u[i]}`;
 }
 const KIND_ICON = { video: '🎬', audio: '🎵', image: '🖼️', other: '📄' };
+/** 封面还没抽好时最多重试几次（每次约 2 秒，合计约 1 分钟；再没有就显示类型图标） */
+const THUMB_MAX_TRIES = 30;
 
 let toastTimer = null;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -492,15 +494,30 @@ function renderCard(item) {
     img.decoding = 'async';
     img.alt = item.name;
     img.dataset.loading = '1';
-    img.onload = () => {
-      delete img.dataset.loading;
-      img.classList.add('loaded');
-    };
-    img.src = item.thumbUrl;
-    img.onerror = () => {
+    // 服务端还没抽出封面时会先回一张 1×1 的透明图（不占连接、不阻塞别的请求），
+    // 这里看到 naturalWidth 是 1 就隔一会儿带 p=1 再来问一次（p=1 走优先队列）。
+    const fallback = () => {
       img.remove();
       if (!thumb.querySelector('.ph')) thumb.appendChild(el('div', 'ph', KIND_ICON[item.kind] || '📄'));
     };
+    const retryLater = () => {
+      if (!img.isConnected) return;            // 卡片已经被重画掉了，别再问
+      if (img.dataset.tries && Number(img.dataset.tries) >= THUMB_MAX_TRIES) { fallback(); return; }
+      const tries = Number(img.dataset.tries || 0) + 1;
+      img.dataset.tries = String(tries);
+      const sep = item.thumbUrl.includes('?') ? '&' : '?';
+      setTimeout(() => {
+        if (!img.isConnected) return;
+        img.src = `${item.thumbUrl}${sep}p=1&r=${tries}`;
+      }, 400 + Math.random() * 400);
+    };
+    img.onload = () => {
+      if (img.naturalWidth <= 1) { retryLater(); return; }
+      delete img.dataset.loading;
+      img.classList.add('loaded');
+    };
+    img.onerror = fallback;
+    img.src = item.thumbUrl;
     thumb.appendChild(img);
   }
   thumb.appendChild(el('div', 'badge', item.kindLabel));

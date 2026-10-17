@@ -23,7 +23,7 @@ const util = require('./lib/util');
 const naming = require('./lib/naming');
 const tagmod = require('./lib/tags');
 const { Database, rebuildTags } = require('./lib/db');
-const { Thumbnails } = require('./lib/thumbnails');
+const { Thumbnails, QUEUE_CAP } = require('./lib/thumbnails');
 const { Journal } = require('./lib/journal');
 const { Library } = require('./lib/library');
 const { Exports, ExportJob } = require('./lib/exporter');
@@ -1484,6 +1484,82 @@ async function testRegressions() {
   }
   check('同时要 6 张封面时真的并行了（峰值 > 1）', peak > 1, `峰值 ${peak}`);
   check('并行数不超过上限（峰值 ≤ 4）', peak <= 4, `峰值 ${peak}`);
+
+  // ---- 请求侧的等待上限（一页 200 张卡片同时要封面时的老问题）----------------
+  // 旧行为：每个 /api/thumb 都老老实实排队等自己的 ffmpeg，最后一个要等几十秒
+  // （用户日志里实测 32 秒），而且把浏览器每个域名的 6 条连接全占住，连带别的接口一起卡。
+  // 新行为：request() 最多等 waitMs，等不到先回占位图；排队满了干脆不入队。
+  const idOf = (n) => T.db.items().find((i) => i.name === n).id;
+  for (let i = 1; i <= 4; i += 1) await writeFile(path.join(thumbLib, `排队${i}.mp4`), 'p');
+  await T.library.scan({ rename: true, prune: true });
+  eq('准备了 4 个没封面的视频', ['排队1.mp4', '排队2.mp4', '排队3.mp4', '排队4.mp4'].filter((n) => !!byName(n)).length, 4);
+
+  const drawJpg = (args) => fs.writeFileSync(args[args.length - 1], Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+  thumbs.setMaxActive(1);
+  thumbs.run = async (_bin, args) => {
+    await sleep(300);
+    drawJpg(args);
+    return true;
+  };
+  const tPending0 = Date.now();
+  const pendingRes = await thumbs.request(idOf('排队1.mp4'), { waitMs: 80 });
+  const pendingMs = Date.now() - tPending0;
+  check('抽帧还没好时先回 pending，不把请求挂在那儿', pendingRes.pending === true, JSON.stringify(pendingRes));
+  check('pending 的返回时间就是 waitMs 那个量级（<300ms）', pendingMs < 300, `${pendingMs}ms`);
+  await sleep(600);
+  const afterPending = await thumbs.request(idOf('排队1.mp4'));
+  check('后台抽完之后再来问就拿到图了', afterPending.ok && afterPending.mime === 'image/jpeg', JSON.stringify(afterPending));
+
+  const tCached = Date.now();
+  const cachedHit = await thumbs.request(idOf('排队1.mp4'));
+  check('已缓存的封面秒回（不排队）', cachedHit.ok && Date.now() - tCached < 120, `${Date.now() - tCached}ms`);
+
+  // 排队满了：不入队、立刻回 pending（否则快速翻页会把几百个抽帧任务都排上）
+  const savedActive = thumbs.active;
+  const savedQueue = thumbs.queue;
+  const savedHot = thumbs.hot;
+  thumbs.active = thumbs.maxActive;   // 假装这一路正忙，pump 不会把假任务取走
+  thumbs.queue = Array.from({ length: QUEUE_CAP }, () => ({ fn: async () => ({ ok: false }), resolve: () => {} }));
+  thumbs.hot = [];
+  const tThrottle = Date.now();
+  let throttled;
+  try {
+    throttled = await thumbs.request(idOf('排队2.mp4'), { waitMs: 1200 });
+  } finally {
+    const queueLen = thumbs.queue.length;
+    thumbs.queue = savedQueue;
+    thumbs.hot = savedHot;
+    thumbs.active = savedActive;
+    eq('排队满的时候没有偷偷入队', queueLen, QUEUE_CAP);
+  }
+  check('排队满时立刻回 pending（throttled）', throttled.pending === true && throttled.throttled === true, JSON.stringify(throttled));
+  check('排队满时也不等（而不是等满 1200ms）', Date.now() - tThrottle < 200, `${Date.now() - tThrottle}ms`);
+
+  // 优先队列：前端重试的（用户正看着的）插到普通请求前面
+  thumbs.setMaxActive(1);
+  const order = [];
+  thumbs.run = async (_bin, args) => {
+    order.push(path.basename(args[args.indexOf('-i') + 1]));
+    await sleep(50);
+    drawJpg(args);
+    return true;
+  };
+  const pFirst = thumbs.request(idOf('排队2.mp4'), { waitMs: 4000 });
+  await sleep(20);
+  const pNormal = thumbs.request(idOf('排队3.mp4'), { waitMs: 4000 });
+  const pPrior = thumbs.request(idOf('排队4.mp4'), { waitMs: 4000, priority: true });
+  await Promise.all([pFirst, pNormal, pPrior]);
+  eq('优先队列插到普通队列前面（A → 优先 → 普通）', order.join(' → '), '排队2.mp4 → 排队4.mp4 → 排队3.mp4');
+
+  // 超时不再退两档：一个坏文件以前能把一个 lane 占 3×25 秒，现在只占一次
+  await writeFile(path.join(thumbLib, '超时.mp4'), 't');
+  await T.library.scan({ rename: true, prune: true });
+  let timeoutCalls = 0;
+  thumbs.run = async () => { timeoutCalls += 1; return { ok: false, timedOut: true }; };
+  const toRes = await thumbs.ensure(idOf('超时.mp4'));
+  check('ffmpeg 超时后不再退 -ss 0.5 / 0（省下 lane）', timeoutCalls === 1 && !toRes.ok, `调用 ${timeoutCalls} 次`);
+  thumbs.run = realRun;
+  thumbs.setMaxActive(4);
 
   const viewThumb = T.library.itemView(T.db.items().find((i) => i.name === '大图.jpg'));
   check('itemView 的缩略图地址带 mtime 版本号', /^\/api\/thumb\/[0-9a-f]{32}\?v=\d+$/.test(viewThumb.thumbUrl), viewThumb.thumbUrl);

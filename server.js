@@ -24,7 +24,7 @@ const util = require('./lib/util');
 const { Database } = require('./lib/db');
 const { Journal } = require('./lib/journal');
 const { Library } = require('./lib/library');
-const { Thumbnails, DEFAULT_MAX_ACTIVE, clampActive } = require('./lib/thumbnails');
+const { Thumbnails, DEFAULT_MAX_ACTIVE, THUMB_WAIT_MS, clampActive } = require('./lib/thumbnails');
 const { Exports } = require('./lib/exporter');
 const tagsMod = require('./lib/tags');
 const naming = require('./lib/naming');
@@ -36,6 +36,16 @@ const SESSION_FILE = path.join(DATA_DIR, 'session.json');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 
 const DEFAULT_PORT = 8787;
+
+/**
+ * 1×1 全透明的 PNG（68 字节）：缩略图还没抽出来时先回它。
+ * 为什么不用 204/404：`<img>` 收到非图片会触发 error，前端就分不清「暂时没有」和
+ * 「永远没有（音频/坏文件）」；回一张真图，前端用 naturalWidth === 1 一眼认出来。
+ */
+const THUMB_PENDING_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
+  'base64',
+);
 
 // ------------------------------------------------------------------ 命令行
 
@@ -728,7 +738,24 @@ route('POST', /^\/api\/collections$/, async (req) => {
 
 route('GET', /^\/api\/thumb\/([0-9a-fA-F]{32})$/, async (req, res, id) => {
   requireLibrary();
-  const result = await state.thumbs.ensure(id);
+  // 一页 200 张卡片同时要封面时，未缓存的请求不能一直排队等（实测有 30 秒的请求，
+  // 而且把浏览器每个域名的 6 条连接全占住，连带其它接口一起卡）。
+  // 这里最多等 THUMB_WAIT_MS，等不到先回 1×1 的透明占位图 + no-store，
+  // 前端发现 naturalWidth 是 1 就过一会儿带 p=1 再来问（那时通常已经抽好了）。
+  const result = await state.thumbs.request(id, {
+    waitMs: THUMB_WAIT_MS,
+    priority: queryOf(req).get('p') === '1',
+  });
+  if (result.pending) {
+    res.writeHead(200, {
+      'Content-Type': 'image/png',
+      'Content-Length': String(THUMB_PENDING_PNG.length),
+      'Cache-Control': 'no-store',
+      'X-Thumb': 'pending',
+    });
+    res.end(THUMB_PENDING_PNG);
+    return undefined;
+  }
   if (!result.ok) {
     // 「没有缩略图」是正常状态，不是服务端错误：音频本来就没有缩略图，视频也可能是没装
     // ffmpeg、或源文件本身没有视频轨（损坏/纯音频 mp4）。一律回 404，让前端安静地显示

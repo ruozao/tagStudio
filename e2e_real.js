@@ -328,7 +328,20 @@ async function waitServer(ms) {
     // ── 3. 缩略图 ─────────────────────────────────────────────────────────
     section('3. 视频缩略图真的抽出来了（ffmpeg 抽帧 + 是真 JPEG）');
     for (const it of videos) {
-      const r = await api.get(`/api/thumb/${it.id}`);
+      // 服务端对未缓存的封面最多等 1.2 秒，抽不完就先回 1×1 占位图（X-Thumb: pending），
+      // 前端会带着 p=1 重试。这里照前端的做法重试，同时盯住「每一次请求都必须很快返回」——
+      // 旧版一页 200 张卡片时最后几张要等几十秒，就是这个断言要防的。
+      let r = null;
+      let jpeg = false;
+      let slowest = 0;
+      for (let i = 0; i < 20 && !jpeg; i += 1) {
+        const t0 = Date.now();
+        r = await api.get(`/api/thumb/${it.id}${i ? `?p=1&r=${i}` : ''}`);
+        slowest = Math.max(slowest, Date.now() - t0);
+        jpeg = r.headers['content-type'] === 'image/jpeg';
+        if (!jpeg) await sleep(400);
+      }
+      check(`「${it.name}」每次要封面都在 1.5 秒内返回（不会挂几十秒）`, slowest < 1500, `最慢 ${slowest}ms`);
       check(`「${it.name}」缩略图返回 200`, r.status === 200, `状态 ${r.status} ${r.text.slice(0, 200)}`);
       const info = jpegInfo(r.buf);
       check(`「${it.name}」缩略图是能解码的 JPEG`, !!info, `拿到 ${r.buf.length} 字节`);
