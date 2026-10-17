@@ -179,6 +179,50 @@ async function testNaming() {
   eq('「未分类」占位符本身是合法标签字面量但不该被当成标签', JSON.stringify(naming.parseTagsFromName(`旅行-风景-${id}.jpg`)), JSON.stringify(['旅行', '风景']));
 }
 
+// ------------------------------------------------------------------ 1b. 遍历目录
+
+async function testWalk() {
+  group('1b. 遍历目录：并发 stat 不改变结果、不错过文件');
+
+  // 并发池本身：顺序无关，但必须「真的并发」且不吞异常。
+  const t0 = Date.now();
+  await util.poolMap(new Array(8).fill(0), 4, async () => { await new Promise((r) => setTimeout(r, 60)); });
+  const poolMs = Date.now() - t0;
+  check('4 路并发跑 8 个 60ms 任务：应该 ~120ms 而不是串行的 480ms', poolMs < 300, `实测 ${poolMs} ms`);
+
+  let threw = false;
+  try { await util.poolMap([1, 2, 3], 2, async (n) => { if (n === 2) throw new Error('boom'); }); } catch { threw = true; }
+  eq('poolMap 不吞异常（walkFiles 是自己按文件 try 的，别的调用方要能看见错）', threw, true);
+
+  // 造一棵有子目录、有中文名、大小各不相同的树，再和「磁盘上实际有什么」逐条比。
+  const root = await freshDir(path.join(VDIR, 'walk'));
+  const expect = [];
+  for (let i = 0; i < 120; i += 1) {
+    const rel = i % 3 === 0 ? `f-${i}.mp4` : i % 3 === 1 ? `子目录/g-${i}.jpg` : `子目录/更深一层/h-${i}.txt`;
+    expect.push(rel);
+    await writeFile(path.join(root, rel), Buffer.alloc(i * 7));
+  }
+  await writeFile(path.join(root, util.META_DIRNAME, 'db.json'), '{}');   // 元数据目录不该算素材
+  await writeFile(path.join(root, '下载中.mp4.part'), 'x');               // 半截文件也不该算
+  expect.sort();
+
+  const walked = await util.walkFiles(root);
+  eq('文件和磁盘上一样多（.mtag 与半截文件都不算）', walked.length, expect.length);
+  eq('相对路径集合一致（posix 风格 + 按 rel 排序）', JSON.stringify(walked.map((f) => f.rel)), JSON.stringify(expect));
+  const statsOk = walked.every((f) => {
+    const real = fs.statSync(f.abs);
+    return f.size === real.size && f.name === path.basename(f.abs) && Math.abs(f.mtimeMs - Math.round(real.mtimeMs)) < 1;
+  });
+  check('每条的 size / name / mtimeMs 都是真实 stat 结果', statsOk);
+
+  const serial = await util.walkFiles(root, { concurrency: 1 });
+  eq('并发度不影响结果（1 路与 64 路完全一致）', JSON.stringify(serial.map((f) => f.rel)), JSON.stringify(walked.map((f) => f.rel)));
+
+  const capped = await util.walkFiles(root, { maxFiles: 10 });
+  eq('maxFiles 上限生效（超大目录不会把库吞掉）', capped.length, 10);
+  eq('截断时仍然是排好序的前 10 个', JSON.stringify(capped.map((f) => f.rel)), JSON.stringify(expect.slice(0, 10)));
+}
+
 // ------------------------------------------------------------------ 2. 标签校验
 
 async function testTags() {
@@ -302,6 +346,32 @@ async function testLibraryScanAndRename() {
   const scan4 = await library.scan({ rename: true, prune: true });
   eq('文件消失后记录被剔除', scan4.removed, 1);
   check('库里不再有这个 id', !db.get(fakeId));
+
+  // 什么都没变时不要再重写整个 db.json。
+  // 以前每趟扫描都无条件 save()：13.4MB 的库被 45 秒一次的定时扫描反复重写，
+  // 而期间所有写操作都排在 exclusive 队列里，表现就是「隔一会儿卡一下」。
+  const dbFile = path.join(LIB, util.META_DIRNAME, 'db.json');
+  const mtimeBefore = (await fsp.stat(dbFile)).mtimeMs;
+  const scanQuiet = await library.scan({ rename: true, prune: true });
+  await new Promise((r) => setTimeout(r, 30));           // 给文件系统一点时间，别让 mtime 精度掩盖问题
+  const mtimeAfter = (await fsp.stat(dbFile)).mtimeMs;
+  eq('没变化的一趟扫描：saved=false（这趟没写盘）', scanQuiet.saved, false);
+  eq('没变化的一趟扫描：db.json 的 mtime 一点没动', mtimeAfter, mtimeBefore);
+  eq('不写盘也照样报告这趟扫了多少文件', scanQuiet.filesOnDisk > 0, true);
+  eq('不写盘时新增/变化/改名仍然是 0', `${scanQuiet.added}/${scanQuiet.changed}/${scanQuiet.renamed}`, '0/0/0');
+
+  // 真有变化时必须写盘（别把上面那条优化做成「永远不存」）—— 用另一个临时库试，免得弄脏 LIB
+  const saveRoot = await freshDir(path.join(VDIR, 'lib-save'));
+  const saveLib = await makeLibrary(saveRoot);
+  const saveFile = path.join(saveRoot, util.META_DIRNAME, 'db.json');
+  await writeFile(path.join(saveRoot, 'a.mp4'), 'x');
+  const saveFirst = await saveLib.library.scan({ rename: true, prune: true });
+  eq('首次扫描认出新文件并写盘', `${saveFirst.added}/${saveFirst.saved}`, '1/true');
+  const saveMtime = (await fsp.stat(saveFile)).mtimeMs;
+  await new Promise((r) => setTimeout(r, 30));
+  const saveAgain = await saveLib.library.scan({ rename: true, prune: true });
+  eq('同一个库再扫一遍：没有变化就不写盘', saveAgain.saved, false);
+  eq('db.json 没被重写', (await fsp.stat(saveFile)).mtimeMs, saveMtime);
 
   // 查询：AND / OR / 未打标签 / 关键词
   eq('按标签查询（AND）', db.query({ tags: ['助眠', '美食'] }).total, 2);
@@ -628,6 +698,46 @@ async function testServer() {
       new Set(st2.recentRoots.map((p) => path.resolve(p))).size, st2.recentRoots.length);
     const bootBack = await postJson('/api/library/boot', { root: serverLib });
     check('能切回原来的库（后面的断言都基于它）', bootBack.ok === true, bootBack.error);
+
+    // 打开库不再等扫描：boot 立刻返回（scan:null + scanning:true），磁盘核对挂到后台。
+    // 这条就是「F:\video 那种上万条的库一打开就卡一下」的修法，契约必须钉住。
+    const lib3 = path.join(VDIR, 'http-lib3');
+    await fsp.mkdir(lib3, { recursive: true });
+    for (const n of ['a.mp4', 'b.jpg', 'c.mp3']) await writeFile(path.join(lib3, n), 'x');
+    const tBoot = Date.now();
+    const boot3 = await postJson('/api/library/boot', { root: lib3 });
+    const bootMs = Date.now() - tBoot;
+    eq('能打开第三个库', boot3.ok, true);
+    eq('boot 的 scan 字段是 null —— 扫描没挡在打开这条路上', boot3.scan, null);
+    eq('并且明确告诉前端「正在后台核对」', boot3.scanning, true);
+    check('打开这一步没等扫描（个位数毫秒；阈值给到 2000ms 只防回归）', bootMs < 2000, `${bootMs} ms`);
+    note(`打开库耗时 ${bootMs} ms（扫描在后台跑）`);
+    const stMount = await (await fetch(`${BASE}/api/state`)).json();
+    eq('挂载本身已经完成了（mounting 归位）', stMount.mounting, null);
+    check('scanning 是个布尔（后台跑多快都不影响挂载结果）', typeof stMount.scanning === 'boolean');
+
+    let stScan = stMount;
+    for (let i = 0; i < 100 && stScan.scanning; i += 1) {
+      await new Promise((r) => setTimeout(r, 50));
+      stScan = await (await fetch(`${BASE}/api/state`)).json();
+    }
+    eq('后台核对自己跑完了（不用谁去催）', stScan.scanning, false);
+    eq('核对结果写进了 lastScan（新增 3 个）', stScan.lastScan && stScan.lastScan.added, 3);
+    eq('后台核对全程没有报错', stScan.lastScanError, null);
+    eq('核对完列表里就是 3 个素材', (await (await fetch(`${BASE}/api/items`)).json()).items.length, 3);
+
+    // 手动「重新扫描」仍然是同步的：用户点完要立刻看到结果，不能变成「点了没反应」
+    const manual = await postJson('/api/scan', {});
+    eq('手动扫描是同步返回的', manual.ok, true);
+    eq('再扫一遍没变化：这趟没写 db.json', manual.saved, false);
+
+    const bootBack2 = await postJson('/api/library/boot', { root: serverLib });
+    check('再切回原来的库（后面的断言都基于它）', bootBack2.ok === true, bootBack2.error);
+    for (let i = 0; i < 100; i += 1) {                   // 等后台核对收尾，别让后面的断言踩在扫描中间
+      const s = await (await fetch(`${BASE}/api/state`)).json();
+      if (!s.scanning) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
 
     const css = await httpGet('/styles.css');
     eq('静态样式表可访问', css.status, 200);
@@ -1350,6 +1460,7 @@ async function main() {
   const t0 = Date.now();
   await freshDir(VDIR);
   await testNaming();
+  await testWalk();
   await testTags();
   await testLibraryScanAndRename();
   await testJournalRecovery();

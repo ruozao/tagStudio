@@ -72,6 +72,11 @@ const state = {
   lastScan: null,
   scanTimer: null,
   scanInterval: 45000,
+  /** 正在打开的库路径（mount 进行中，前端据此显示「正在打开…」而不是让用户重选文件夹） */
+  mounting: null,
+  /** 后台核对素材中（打开库不再等扫描，扫完这里变回 false） */
+  scanning: false,
+  lastScanError: null,
 };
 
 /**
@@ -112,6 +117,16 @@ function rememberRoot(absRoot) {
 /** 库整体挂载/切换。切换是「先建新、成功后再换」，失败不会把已有会话弄坏。 */
 async function mount(root, opts = {}) {
   const absRoot = path.resolve(root);
+  state.mounting = absRoot;              // 前端据此显示「正在打开…」，而不是让用户重新选目录
+  try {
+    return await openLibrary(absRoot, opts);
+  } finally {
+    state.mounting = null;
+  }
+}
+
+/** mount 的正文（absRoot 已经是绝对路径） */
+async function openLibrary(absRoot, opts = {}) {
   const st = await fsp.stat(absRoot).catch(() => null);
   if (!st) {
     if (!opts.create) throw new Error(`目录不存在：${absRoot}`);
@@ -150,7 +165,10 @@ async function mount(root, opts = {}) {
   // 恢复和首次扫描都只依赖新建的这几个对象，先做完再切换全局状态：
   // 中途失败时旧库照常可用，不会留下一个「state 指向新库、新库却没开成」的半成品。
   const recovery = await library.recover();
-  const scan = await library.scan({ rename: true, prune: true });
+  // 扫描默认挪到后台（opts.deferScan）：18,000 个文件的库扫一趟要一秒多，而「打开库」
+  // 只需要 db.json 已经读进内存 —— 让用户先看见列表，磁盘核对随后跟上。
+  // 调用方在这种模式下必须自己调 startBackgroundScan()（**不能在 exclusive 里调**）。
+  const scan = opts.deferScan ? null : await library.scan({ rename: true, prune: true });
 
   state.root = absRoot;
   state.db = db;
@@ -159,25 +177,52 @@ async function mount(root, opts = {}) {
   state.thumbs = thumbs;
   state.exports = exports;
   state.bootError = null;
-  state.lastScan = scan;
+  state.lastScan = scan || lastScanFromDb(db);
   state.ready = true;
 
   await saveConfig({ lastRoot: absRoot, recentRoots: rememberRoot(absRoot) });
   scheduleScan();
-  return { root: absRoot, recovery, scan };
+  return { root: absRoot, recovery, scan, pendingScan: !!opts.deferScan };
+}
+
+/** 后台还没扫完时，先拿库文件里记的「上次扫描」顶上，顶栏不至于空着。 */
+function lastScanFromDb(db) {
+  const at = db && db.db && db.db.stats ? db.db.stats.lastScanAt : null;
+  if (!at) return null;
+  return { scannedAt: at, added: 0, removed: 0, renamed: 0, restored: true };
+}
+
+/**
+ * 在后台核对磁盘和库的差异（不阻塞打开库）。
+ * 必须在 exclusive 之外调用 —— exclusive 里再调 exclusive 会自己等自己。
+ */
+function startBackgroundScan(opts = {}) {
+  if (!state.ready || !state.library) return null;
+  if (state.scanning) return state.scanPromise || null;
+  state.scanning = true;
+  state.lastScanError = null;
+  const run = exclusive(() => state.library.scan({ rename: true, prune: true, ...opts }))
+    .then((res) => {
+      state.lastScan = res;
+      state.scanning = false;
+      return res;
+    })
+    .catch((err) => {
+      state.scanning = false;
+      state.lastScanError = String(err && err.message);
+      process.stderr.write(`[scan] ${state.lastScanError}\n`);
+      return null;
+    });
+  state.scanPromise = run;
+  return run;
 }
 
 function scheduleScan() {
   if (state.scanTimer) clearInterval(state.scanTimer);
   if (!state.scanInterval) return;
-  state.scanTimer = setInterval(async () => {
-    if (!state.ready) return;
-    try {
-      const res = await exclusive(() => state.library.scan({ rename: true, prune: true }));
-      if (res.added || res.removed || res.matched || res.renamed) state.lastScan = res;
-    } catch (err) {
-      process.stderr.write(`[scan] ${err && err.message}\n`);
-    }
+  state.scanTimer = setInterval(() => {
+    if (!state.ready || state.scanning) return;    // 上一趟还没跑完就别叠
+    startBackgroundScan();
   }, state.scanInterval);
   if (state.scanTimer.unref) state.scanTimer.unref();
 }
@@ -360,6 +405,11 @@ route('GET', /^\/api\/state$/, async () => {
   return {
     ok: true,
     ready: state.ready,
+    // 打开库不再等扫描：mounting = 正在打开哪个目录，scanning = 后台还在核对磁盘。
+    // 前端靠这两个字段决定显示「正在打开…」还是先渲染列表。
+    mounting: state.mounting || null,
+    scanning: !!state.scanning,
+    lastScanError: state.lastScanError || null,
     bootError: state.bootError,
     root: state.root,
     // 顶栏那个「快速切换到用过的文件夹」下拉框的数据
@@ -390,8 +440,10 @@ route('POST', /^\/api\/library\/boot$/, async (req) => {
   if (!root) throw new ApiError(400, '请填写素材文件夹的完整路径');
   if (body.create === false && !(await util.exists(root))) throw new ApiError(404, `目录不存在：${root}`);
   try {
-    const result = await exclusive(() => mount(root, { create: body.create !== false }));
-    return { ok: true, ...result, stats: state.db.stats() };
+    const result = await exclusive(() => mount(root, { create: body.create !== false, deferScan: true }));
+    // 扫描放到队尾：等上面这趟 exclusive 让出之后再排队，否则会自己等自己。
+    startBackgroundScan();
+    return { ok: true, ...result, scanning: true, stats: state.db.stats() };
   } catch (err) {
     state.bootError = String(err && err.message);
     throw new ApiError(400, `打开库失败：${state.bootError}`);
@@ -964,25 +1016,9 @@ async function main() {
   state.scanInterval = args.scanInterval != null ? args.scanInterval : 45000;
   const port = args.port || state.config.port || DEFAULT_PORT;
 
-  const rootArg = args.root || null;
-  if (rootArg) {
-    try {
-      const result = await mount(rootArg, { create: true });
-      process.stdout.write(`[tagStudio] 已打开库：${result.root}（新增 ${result.scan.added} / 剔除 ${result.scan.removed} / 重命名 ${result.scan.renamed}）\n`);
-    } catch (err) {
-      state.bootError = String(err && err.message);
-      process.stderr.write(`[tagStudio] 打开 ${rootArg} 失败：${state.bootError}\n`);
-    }
-  } else if (state.config.lastRoot && await util.exists(state.config.lastRoot)) {
-    try {
-      const result = await mount(state.config.lastRoot, { create: false });
-      process.stdout.write(`[tagStudio] 恢复上次的库：${result.root}（新增 ${result.scan.added} / 剔除 ${result.scan.removed}）\n`);
-    } catch (err) {
-      state.bootError = String(err && err.message);
-      process.stderr.write(`[tagStudio] 恢复上次的库失败：${state.bootError}\n`);
-    }
-  }
-
+  // 先 listen 再打开库：打开一个几万条的库要读元数据 + 核对磁盘，这段时间端口一直没起来，
+  // 页面就只能干等（或者提示连不上）。先让端口可用，前端会看到 ready:false + mounting，
+  // 显示「正在打开…」并在库挂好之后自己进来。
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, '127.0.0.1', resolve);
@@ -995,9 +1031,27 @@ async function main() {
     process.exit(1);
   });
 
+  // 打开库放到后台（挪出启动关键路径），扫完再把「新增/剔除」补一句日志。
+  const bootRoot = args.root || (state.config.lastRoot && await util.exists(state.config.lastRoot) ? state.config.lastRoot : null);
+  if (bootRoot) {
+    const label = args.root ? '已打开库' : '恢复上次的库';
+    exclusive(() => mount(bootRoot, { create: !!args.root, deferScan: true }))
+      .then((result) => {
+        process.stdout.write(`[tagStudio] ${label}：${result.root}（正在后台核对素材…）\n`);
+        return startBackgroundScan();
+      })
+      .then((res) => {
+        if (res) process.stdout.write(`[tagStudio] 核对完成：${res.filesOnDisk} 个文件，新增 ${res.added} / 剔除 ${res.removed} / 重命名 ${res.renamed}\n`);
+      })
+      .catch((err) => {
+        state.bootError = String(err && err.message);
+        process.stderr.write(`[tagStudio] 打开 ${bootRoot} 失败：${state.bootError}\n`);
+      });
+  }
+
   const url = `http://127.0.0.1:${port}/`;
   process.stdout.write(`\n  tagStudio 已启动 → ${url}\n`);
-  process.stdout.write(state.ready ? `  素材库：${state.root}\n` : '  还没有选择素材文件夹：请在页面顶部「设置」里指定，或 node server.js --root <目录>\n');
+  process.stdout.write(bootRoot ? `  素材库：${bootRoot}\n` : '  还没有选择素材文件夹：请在页面顶部「设置」里指定，或 node server.js --root <目录>\n');
   process.stdout.write('  按 Ctrl+C 退出\n\n');
 
   if (args.open) openBrowser(url);

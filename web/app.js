@@ -26,6 +26,7 @@ function humanBytes(n) {
 const KIND_ICON = { video: '🎬', audio: '🎵', image: '🖼️', other: '📄' };
 
 let toastTimer = null;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function toast(msg, kind) {
   const t = $('#toast');
   t.textContent = msg;
@@ -81,6 +82,10 @@ const S = {
   defaultExportRoot: null,
   scanInterval: 0,
   lastScan: null,
+  // 服务端正在打开的库（打开库不再等扫描，所以「打开中」「核对中」是两个独立状态）
+  mounting: null,
+  scanning: false,
+  lastScanError: null,
   suggest: { count: 0, itemCount: 0, groups: [] },
   busy: false,
 };
@@ -94,6 +99,7 @@ let jobES = null;
 async function init() {
   await refreshState();
   bindEvents();
+  if (!S.ready && S.mounting) await waitForMount();     // 服务端正打开上次的库
   if (!S.ready) {
     $('#boot').hidden = false;
     $('#bootPath').focus();
@@ -104,6 +110,45 @@ async function init() {
   await refreshSuggestions();
   // 冷启动时如果文件名里认得出标签，直接问用户一次（这是「自动识别」最主要的时机）
   if (S.suggest.itemCount) openSuggestions();
+  // 打开库不再等扫描：列表已经出来了，磁盘核对在后台继续，扫完再静默刷新一次
+  if (S.scanning) waitForScan();
+}
+
+/**
+ * 等后台那趟「打开素材库」跑完（服务端先 listen、后挂库，所以可能一进来还没挂好）。
+ * 成功返回 true；库打不开（或压根没在打开）返回 false，交回给启动页让用户自己选目录。
+ */
+async function waitForMount() {
+  $('#boot').hidden = false;
+  const msg = $('#bootMsg');
+  msg.className = 'msg';
+  msg.textContent = '正在打开上次的素材库…';
+  for (let i = 0; i < 300; i += 1) {                   // 最多等 60 秒
+    await sleep(200);
+    await refreshState();
+    if (S.ready) return true;
+    if (!S.mounting) return false;
+  }
+  return false;
+}
+
+/**
+ * 后台核对素材（扫磁盘）跑完之前先不打扰用户；扫完刷新一次列表/统计。
+ * 打开一个几万条的库扫一趟要一秒多 —— 等它就是在开库这件事上卡一下。
+ */
+async function waitForScan() {
+  const before = S.stats ? S.stats.total : 0;
+  for (let i = 0; i < 600; i += 1) {                   // 最多等 5 分钟
+    await sleep(500);
+    try { await refreshState(); } catch { return; }
+    if (!S.scanning) break;
+  }
+  if (S.scanning) return;                              // 超大库还在扫：界面照常可用，不再折腾
+  const after = S.stats ? S.stats.total : 0;
+  await afterMutation();
+  if (S.lastScanError) { toast(`核对素材出错：${S.lastScanError}`, 'err'); return; }
+  const added = S.lastScan ? S.lastScan.added : after - before;
+  if (added > 0) toast(`核对完成：新认出 ${added} 个素材`, 'ok');
 }
 
 async function refreshState() {
@@ -117,6 +162,9 @@ async function refreshState() {
   S.defaultExportRoot = st.defaultExportRoot || null;
   S.scanInterval = st.scanInterval || 0;
   S.lastScan = st.lastScan || null;
+  S.mounting = st.mounting || null;
+  S.scanning = !!st.scanning;
+  S.lastScanError = st.lastScanError || null;
   S.recentRoots = Array.isArray(st.recentRoots) ? st.recentRoots : [];
   renderHeader();
 }
@@ -1480,13 +1528,17 @@ async function boot(root) {
     const res = await api('/api/library/boot', { method: 'POST', body: { root } });
     $('#boot').hidden = true;
     $('#settings').close();
-    toast(`已打开素材库（${res.stats.total} 个素材，本次扫描新增 ${res.scan ? res.scan.added : 0}）`, 'ok');
+    // 打开库不再等扫描：先把列表亮出来，磁盘核对在后台跑完再静默刷新。
+    // 几万条的库这一趟要一秒多，等它就是在「打开」这件事上硬卡一下。
+    S.scanning = !!res.scanning;
+    toast(`已打开素材库（${res.stats.total} 个素材${S.scanning ? '，正在后台核对…' : ''}）`, 'ok');
     S.selection.clear();
     S.offset = 0;
     await afterMutation();
     msg.textContent = '';
     // 刚打开的文件夹里如果有「标签1-标签2.ext」这种文件名，弹窗问用户要不要认成标签
     if (S.suggest.itemCount) openSuggestions();
+    if (S.scanning) waitForScan();
   } catch (err) {
     msg.className = 'msg err';
     msg.textContent = err.message;
